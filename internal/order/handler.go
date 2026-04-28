@@ -141,8 +141,8 @@ func (h *Handler) Create(c *gin.Context) {
 
 	log.Info("CREATE", "Order placed successfully", "order_id", order.ID, "order_number", order.OrderNumber, "user_id", userID, "total", order.Total, "items_count", len(items))
 
-	go utils.SendSMS(req.ShippingAddress.Phone,
-		fmt.Sprintf("Order %s placed! Total: Rs.%d. We'll update you on shipping.", order.OrderNumber, order.Total/100), "HIGH")
+	// Send order confirmation SMS via MSG91
+	go utils.SendOrderConfirmationSMS(req.ShippingAddress.Phone, order.OrderNumber, order.Total)
 
 	c.JSON(http.StatusCreated, order)
 }
@@ -225,9 +225,8 @@ func (h *Handler) Cancel(c *gin.Context) {
 
 	log.Info("CANCEL", "Order cancelled", "order_id", orderID, "order_number", order.OrderNumber, "user_id", userID, "reason", req.Reason, "refund_pending", order.PaymentStatus == "paid")
 
-	go utils.SendSMS(order.ShippingAddress.Phone,
-		fmt.Sprintf("Order %s cancelled. %s", order.OrderNumber,
-			func() string { if order.PaymentStatus == "paid" { return "Refund will be processed in 5-7 business days." }; return "" }()), "HIGH")
+	// Send cancellation SMS via MSG91
+	go utils.SendOrderCancelledSMS(order.ShippingAddress.Phone, order.OrderNumber)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Order cancelled", "refund_amount": order.Total})
 }
@@ -294,13 +293,32 @@ func (h *Handler) UpdateStatus(c *gin.Context) {
 		return
 	}
 
+	// Fetch order for SMS and stock operations
+	var order models.Order
+	h.db.Collection("orders").FindOne(ctx, bson.M{"_id": id}).Decode(&order)
+
 	if req.Status == "cancelled" || req.Status == "returned" {
-		var order models.Order
-		h.db.Collection("orders").FindOne(ctx, bson.M{"_id": id}).Decode(&order)
 		for _, item := range order.Items {
 			h.db.Collection("products").UpdateOne(ctx, bson.M{"_id": item.ProductID}, bson.M{"$inc": bson.M{"stock": item.Quantity}})
 		}
 		log.Info("UPDATE_STATUS", "Stock restored for cancelled/returned order", "order_id", id, "items", len(order.Items))
+	}
+
+	// Send status-specific SMS via MSG91
+	if order.ShippingAddress.Phone != "" {
+		switch req.Status {
+		case "confirmed":
+			go utils.SendOrderSMS(order.ShippingAddress.Phone,
+				fmt.Sprintf("Your order #%s has been confirmed and is being prepared!", order.OrderNumber))
+		case "shipped":
+			trackingInfo := req.TrackingID
+			if trackingInfo == "" { trackingInfo = "N/A" }
+			go utils.SendOrderShippedSMS(order.ShippingAddress.Phone, order.OrderNumber, trackingInfo, "")
+		case "delivered":
+			go utils.SendOrderDeliveredSMS(order.ShippingAddress.Phone, order.OrderNumber)
+		case "cancelled":
+			go utils.SendOrderCancelledSMS(order.ShippingAddress.Phone, order.OrderNumber)
+		}
 	}
 
 	log.Info("UPDATE_STATUS", "Order status updated", "order_id", id, "new_status", req.Status)
