@@ -14,8 +14,12 @@ type Config struct {
 	MSG91AuthKey     string
 	MSG91TemplateID  string
 	// Payment
+	PaymentGateway   string // "razorpay" or "cashfree"
 	RazorpayKeyID    string
 	RazorpaySecret   string
+	CashfreeAppID    string
+	CashfreeSecret   string
+	CashfreeEnv      string // "sandbox" or "production"
 	// Shipping
 	ShiprocketEmail  string
 	ShiprocketPass   string
@@ -38,8 +42,12 @@ func Load() *Config {
 		OTPService:      getEnv("OTP_SERVICE", "mock"),
 		MSG91AuthKey:    getEnv("MSG91_AUTH_KEY", ""),
 		MSG91TemplateID: getEnv("MSG91_TEMPLATE_ID", ""),
+		PaymentGateway:  getEnv("PAYMENT_GATEWAY", "razorpay"),
 		RazorpayKeyID:   getEnv("RAZORPAY_KEY_ID", ""),
 		RazorpaySecret:  getEnv("RAZORPAY_KEY_SECRET", ""),
+		CashfreeAppID:   getEnv("CASHFREE_APP_ID", ""),
+		CashfreeSecret:  getEnv("CASHFREE_SECRET_KEY", ""),
+		CashfreeEnv:     getEnv("CASHFREE_ENV", "sandbox"),
 		ShiprocketEmail: getEnv("SHIPROCKET_EMAIL", ""),
 		ShiprocketPass:  getEnv("SHIPROCKET_PASSWORD", ""),
 		ShiprocketToken: getEnv("SHIPROCKET_TOKEN", ""),
