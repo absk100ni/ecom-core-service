@@ -9,6 +9,9 @@ type Config struct {
 	RedisAddr        string
 	JWTSecret        string
 	Environment      string
+	CORSOrigins      string // comma-separated allowed origins
+	LogLevel         string // debug, info, warn, error
+	LogFormat        string // "json" or "text"
 	// OTP
 	OTPService       string
 	MSG91AuthKey     string
@@ -39,6 +42,9 @@ func Load() *Config {
 		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
 		JWTSecret:       getEnv("JWT_SECRET", "dev-secret-key"),
 		Environment:     getEnv("ENVIRONMENT", "development"),
+		CORSOrigins:     getEnv("CORS_ORIGINS", "*"),
+		LogLevel:        getEnv("LOG_LEVEL", "info"),
+		LogFormat:       getEnv("LOG_FORMAT", "text"),
 		OTPService:      getEnv("OTP_SERVICE", "mock"),
 		MSG91AuthKey:    getEnv("MSG91_AUTH_KEY", ""),
 		MSG91TemplateID: getEnv("MSG91_TEMPLATE_ID", ""),
