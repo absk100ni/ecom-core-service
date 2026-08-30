@@ -1,186 +1,71 @@
-# 🛒 E-Commerce Core Service
+# 🛒 LucubraElec — E-Commerce Core Service
 
-A complete, production-ready e-commerce backend in Go/Gin/MongoDB. Powers the entire e-commerce platform with Product Catalog, Cart, Orders, Payments (Razorpay), Shipping (Shiprocket), Auth (OTP/JWT), Reviews, Wishlist, Coupons, and Admin APIs.
+Go/Gin/MongoDB/Redis backend powering [LucubraElec.in](https://lucubraelec.in) — electronics & components store. Product catalog, cart, orders, payments (Razorpay), shipping (Shipmozo), Google OAuth + guest checkout, reviews, wishlist, coupons, invoicing, and admin APIs.
 
 📄 **[Database Design Documentation](DATABASE_DESIGN.md)** — full schema, indexes, scaling rationale, and ER diagram.
 
 ## 🚀 Quick Start
 
 ```bash
-cd ecom-core-service
 go mod tidy
-MONGO_URI="mongodb://localhost:27017/ecom" go run ./cmd/api/
+set -a; source .env; set +a   # no godotenv — env must be in the process
+go run ./cmd/api/
 ```
 
-Server starts on **http://localhost:8080**
+Server starts on **http://localhost:8080**. Health: `GET /health`.
 
-## ✅ What's Done
+## ✅ Feature Status
 
 | Feature | Status | Details |
 |---------|--------|---------|
-| Auth (OTP + JWT) | ✅ Complete | Phone OTP login, mock mode for dev, MSG91 for prod |
-| Product Catalog | ✅ Complete | CRUD, search, categories, variants, slugs, images |
-| Shopping Cart | ✅ Complete | Add/remove/update, stock validation, auto-pricing |
-| Orders | ✅ Complete | Create from cart, coupons, stock deduction, order numbers |
-| Payments (Razorpay) | ✅ Complete | Real Razorpay REST API, signature verification, webhooks |
-| Shipping (Shiprocket) | ✅ Complete | AWB creation, tracking, webhooks, mock mode |
-| Coupons | ✅ Complete | Percentage/fixed, min order, max discount, expiry, usage limit |
-| Wishlist | ✅ Complete | Add/remove/list |
-| Reviews | ✅ Complete | Star rating, text review, admin moderation |
-| User Profile | ✅ Complete | View/update profile, addresses |
-| Image Upload | ✅ Complete | S3 upload with local fallback |
-| Admin APIs | ✅ Complete | Products CRUD, orders, users, stats dashboard |
-| SMS Notifications | ✅ Complete | MSG91 direct SMS for order updates (confirmation, shipped, delivered, cancelled) |
-| Structured Logging | ✅ Complete | Color-coded logs with 60+ error codes |
-| Rate Limiting | ✅ Complete | Per-IP rate limiting on auth routes |
+| Auth | ✅ | Google OAuth (JWT sessions); guest checkout needs no account |
+| Guest checkout | ✅ | Public `/guest/*` routes, stateless HMAC token (orderID\|phone), rate-limited, track by order number + phone |
+| Products | ✅ | CRUD, search, 3-level categories, variants, unique slugs, images |
+| Cart | ✅ | Total-quantity stock validation, live stock enrichment, guest cart merge |
+| Orders | ✅ | Atomic stock reservation, status state machine, order numbers (ORD-XXXXXXXXX) |
+| Payments | ✅ | Razorpay (live test-mode verified): signature verification (timing-safe, fail-closed), webhooks, partial payment (whole-rupee advance + COD remainder), refunds |
+| All-or-nothing flow | ✅ | Abandon on modal dismiss releases stock+coupon; late-UPI webhook resurrection with auto-refund fallback; 24h purge |
+| Expiry sweeper | ✅ | Unpaid orders auto-expire after 30 min (stock + coupon released) |
+| Shipping | ✅ | Shipmozo (live): push-order + auto-assign → AWB, rate-calculator-backed serviceability, tracking, delivery webhook (sets `cod_collected`), mock provider when keys unset |
+| Notifications | ✅ | WhatsApp via Meta Cloud API (mock until credentials set), guest-aware (uses shipping phone); email skips gracefully |
+| Coupons | ✅ | %/fixed, min order, max discount, expiry, usage limits, whole-rupee rounding |
+| Invoices | ✅ | Per-order invoice endpoint |
+| Admin APIs | ✅ | Products/orders/users/stats/refunds, order search (all ID shapes), status transitions enforced server-side |
+| Observability | ✅ | Structured logging (60+ error codes), per-IP rate limiting, request IDs |
+| Tests | ✅ | Unit tests: payments, orders, guest tokens, shipping adapter, state machine |
 
-## ❌ What's Left To Do
+## ❌ Left for launch
 
-### 🔴 Must Have (Before Production)
-- [ ] **Razorpay Test Keys** — Sign up at [dashboard.razorpay.com](https://dashboard.razorpay.com), get test keys, set `RAZORPAY_KEY_ID` + `RAZORPAY_KEY_SECRET`
-- [ ] **MongoDB Atlas** — Create free M0 cluster at [cloud.mongodb.com](https://cloud.mongodb.com), update `MONGO_URI`
-- [ ] **MSG91 Account** — Sign up at [msg91.com](https://msg91.com), get auth key, set `OTP_SERVICE=msg91`, `MSG91_AUTH_KEY`, `MSG91_TEMPLATE_ID`
-- [ ] **JWT Secret** — Change `JWT_SECRET` from default `dev-secret-key` to a strong random string
-- [ ] **CORS Configuration** — Update allowed origins for production domain
+- [ ] Deploy: Railway (backend) + MongoDB Atlas + Upstash Redis
+- [ ] Register live webhooks: Razorpay + Shipmozo → `https://api.lucubraelec.in/...`
+- [ ] Razorpay live-mode keys (KYC pending; test-mode works now)
+- [ ] Meta/WhatsApp Business credentials (notifications currently mock/logged)
+- [ ] Shipmozo dashboard: auto-assign rule + wallet recharge
 
-### 🟡 Should Have (Enhancement)
-- [ ] **Real Shiprocket Integration** — Sign up at [app.shiprocket.in](https://app.shiprocket.in), set credentials (currently mock)
-- [ ] **S3 Image Upload** — Configure `S3_BUCKET` + `S3_REGION` + AWS credentials (currently saves locally)
-- [ ] **Email Notifications** — Add email templates for order confirmation, shipping updates
-- [ ] **Search Enhancement** — Add MongoDB text indexes for full-text product search
-- [ ] **Pagination Metadata** — Add `next_page`, `has_more` to list endpoints
-- [ ] **Order Invoice PDF** — Generate downloadable invoice for each order
-- [ ] **Admin Analytics** — Revenue charts, top products, conversion rates
+## 📡 API Highlights
 
-### 🔵 Nice To Have (Future)
-- [ ] **Redis Caching** — Cache product lists, categories for faster reads
-- [ ] **Elasticsearch** — For advanced product search with filters, facets
-- [ ] **Multi-tenant Support** — Support multiple stores from one backend
-- [ ] **Webhook Signature Verification** — Verify Razorpay webhook signatures
-- [ ] **Database Migrations** — Version-controlled schema changes
-- [ ] **Unit Tests** — Test coverage for handlers
-- [ ] **Docker Compose** — One-command setup with MongoDB + Redis + Backend
-- [ ] **API Documentation** — Swagger/OpenAPI spec generation
-- [ ] **Inventory Alerts** — Low stock notifications to admin
+Public: `GET /products`, `GET /products/:idOrSlug`, `GET /categories/tree`, `GET /shipping/serviceability/:pincode`, `POST /coupons/validate`, `POST /payment/webhook`, `POST /shipping/webhook`
+Guest: `POST /guest/orders`, `POST /guest/payment/create|verify`, `POST /guest/orders/:id/abandon`, `GET /guest/track`
+Authed: cart CRUD, `POST /orders`, `POST /orders/:id/abandon`, wishlist, reviews, profile
+Admin: products/categories/coupons CRUD, `GET /admin/orders?q=&status=&payment_status=`, `PUT /admin/orders/:id/status` (state-machine enforced), `POST /admin/orders/:id/ship|refund`, stats, returns, invoices
 
-## 📡 Complete API Reference
+## ⚙️ Key Configuration
 
-### Auth (Public)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/auth/send-otp` | Send OTP to phone |
-| POST | `/api/v1/auth/verify-otp` | Verify OTP, get JWT |
-
-### Products (Public)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/products` | List products (`?category=&search=&page=&limit=`) |
-| GET | `/api/v1/products/:id` | Get product by ID or slug |
-| GET | `/api/v1/categories` | List categories |
-
-### Cart (Auth Required)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/cart` | Get user's cart |
-| POST | `/api/v1/cart/add` | Add item to cart |
-| PUT | `/api/v1/cart/item/:productId` | Update quantity |
-| DELETE | `/api/v1/cart/item/:productId` | Remove item |
-| DELETE | `/api/v1/cart` | Clear cart |
-
-### Orders (Auth Required)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/orders` | Create order from cart |
-| GET | `/api/v1/orders` | List user's orders |
-| GET | `/api/v1/orders/:id` | Get order details |
-| POST | `/api/v1/orders/:id/cancel` | Cancel order |
-
-### Payments (Auth Required)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/payment/create` | Create Razorpay order (real API call) |
-| POST | `/api/v1/payment/verify` | Verify payment signature |
-| POST | `/api/v1/payment/webhook` | Razorpay webhook (public) |
-
-### Wishlist (Auth Required)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/wishlist` | Get wishlist |
-| POST | `/api/v1/wishlist/:productId` | Add to wishlist |
-| DELETE | `/api/v1/wishlist/:productId` | Remove from wishlist |
-
-### Reviews (Auth Required)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/reviews` | Submit a review |
-| GET | `/api/v1/reviews/:productId` | Get product reviews |
-
-### Shipping
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/shipping/track/:orderId` | Track shipment |
-
-### Admin (Admin Only)
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/admin/products` | Create product |
-| PUT | `/api/v1/admin/products/:id` | Update product |
-| DELETE | `/api/v1/admin/products/:id` | Delete product |
-| POST | `/api/v1/admin/categories` | Create category |
-| GET | `/api/v1/admin/orders` | List all orders |
-| PUT | `/api/v1/admin/order/:id/status` | Update order status + send SMS |
-| POST | `/api/v1/admin/order/:id/refund` | Process refund |
-| POST | `/api/v1/admin/shipping/create` | Create shipment |
-| GET | `/api/v1/admin/users` | List all users |
-| GET | `/api/v1/admin/stats` | Dashboard stats |
-| POST | `/api/v1/admin/upload` | Upload image (S3/local) |
-
-## 🏗 Architecture
-
-```
-ecom-core-service/
-├── cmd/api/main.go              # Entry point, routes
-├── internal/
-│   ├── auth/handler.go          # OTP + JWT authentication
-│   ├── product/handler.go       # CRUD, search, categories
-│   ├── cart/handler.go          # Cart operations
-│   ├── order/handler.go         # Orders + SMS notifications
-│   ├── payment/handler.go       # Razorpay REST API integration
-│   ├── shipping/handler.go      # Shiprocket integration
-│   ├── coupon/handler.go        # Coupon management
-│   ├── wishlist/handler.go      # Wishlist CRUD
-│   ├── review/handler.go        # Product reviews
-│   ├── user/handler.go          # Profile management
-│   ├── upload/handler.go        # S3/local file upload
-│   ├── config/config.go         # Environment configuration
-│   ├── middleware/middleware.go  # Auth, CORS, rate limiting
-│   └── models/models.go         # All data models
-├── pkg/
-│   ├── logger/logger.go         # Structured color-coded logging
-│   ├── errcodes/codes.go        # 60+ categorized error codes
-│   └── utils/notifier.go        # MSG91 SMS + notification service
-└── go.mod
-```
-
-## ⚙️ Configuration
-
-| Variable | Default | Required | Description |
-|----------|---------|----------|-------------|
-| PORT | 8080 | No | Server port |
-| MONGO_URI | mongodb://localhost:27017/ecom | **Yes** | MongoDB connection |
-| MONGO_DB | ecom | No | Database name |
-| JWT_SECRET | dev-secret-key | **Yes (prod)** | JWT signing key |
-| OTP_SERVICE | mock | No | `mock` or `msg91` |
-| MSG91_AUTH_KEY | — | For SMS | MSG91 auth key |
-| MSG91_TEMPLATE_ID | — | For OTP | MSG91 OTP template |
-| SMS_MODE | mock | No | `mock` or `msg91` for order SMS |
-| RAZORPAY_KEY_ID | — | For payments | Razorpay key ID |
-| RAZORPAY_KEY_SECRET | — | For payments | Razorpay secret |
-| SHIPROCKET_EMAIL | — | For shipping | Shiprocket email |
-| SHIPROCKET_PASSWORD | — | For shipping | Shiprocket password |
-| S3_BUCKET | — | For uploads | AWS S3 bucket name |
-| S3_REGION | ap-south-1 | No | AWS region |
-| NOTIFICATION_SERVICE_URL | http://localhost:9090 | No | Notification service URL |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| MONGO_URI / MONGO_DB | Yes | MongoDB connection |
+| REDIS_URL | Yes | Cache + serviceability cache |
+| JWT_SECRET | Yes (prod) | JWT signing key |
+| GOOGLE_CLIENT_ID | Yes (prod) | Google OAuth |
+| GUEST_ORDER_SECRET | Yes (prod) | HMAC key for guest tokens (fail-closed) |
+| PAYMENT_GATEWAY | No | `razorpay` (default; `stripe` parked) |
+| RAZORPAY_KEY_ID / KEY_SECRET / WEBHOOK_SECRET | For payments | Signature verification fail-closed in prod |
+| SHIPMOZO_PUBLIC_KEY / PRIVATE_KEY | For shipping | Absent → mock provider |
+| SHIPMOZO_WAREHOUSE_ID | For shipping | Registered pickup warehouse (required for AWB assign) |
+| WAREHOUSE_PINCODE | For shipping | Origin pincode for serviceability |
+| WHATSAPP_* (Meta Cloud API) | For notifications | Absent → mock mode (logs) |
+| PENDING_ORDER_TTL_MINUTES | No | Unpaid-order expiry (default 30) |
+| LOG_LEVEL | No | `info` default; `debug` logs raw courier API bodies |
 
 ## 📄 License
 MIT
