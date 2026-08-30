@@ -52,8 +52,12 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 	defer cancel()
 
 	set := bson.M{"updated_at": time.Now()}
-	if req.Name != "" { set["name"] = req.Name }
-	if req.Email != "" { set["email"] = req.Email }
+	if req.Name != "" {
+		set["name"] = req.Name
+	}
+	if req.Email != "" {
+		set["email"] = req.Email
+	}
 
 	result, err := h.db.Collection("users").UpdateOne(ctx, bson.M{"_id": userID}, bson.M{"$set": set})
 	if err != nil || result.MatchedCount == 0 {
@@ -74,7 +78,9 @@ func (h *Handler) ListAddresses(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
-	if user.Addresses == nil { user.Addresses = []models.Address{} }
+	if user.Addresses == nil {
+		user.Addresses = []models.Address{}
+	}
 	c.JSON(http.StatusOK, gin.H{"addresses": user.Addresses, "total": len(user.Addresses)})
 }
 
@@ -88,8 +94,12 @@ func (h *Handler) AddAddress(c *gin.Context) {
 	}
 
 	addr.ID = uuid.New().String()
-	if addr.Country == "" { addr.Country = "India" }
-	if addr.Label == "" { addr.Label = "Home" }
+	if addr.Country == "" {
+		addr.Country = "India"
+	}
+	if addr.Label == "" {
+		addr.Label = "Home"
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -97,7 +107,9 @@ func (h *Handler) AddAddress(c *gin.Context) {
 	// If is_default or first address, clear other defaults
 	var user models.User
 	h.db.Collection("users").FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
-	if len(user.Addresses) == 0 { addr.IsDefault = true }
+	if len(user.Addresses) == 0 {
+		addr.IsDefault = true
+	}
 
 	if addr.IsDefault {
 		h.db.Collection("users").UpdateOne(ctx, bson.M{"_id": userID},
@@ -126,7 +138,9 @@ func (h *Handler) UpdateAddress(c *gin.Context) {
 	set := bson.M{"updated_at": time.Now()}
 	fields := []string{"name", "label", "line1", "line2", "city", "state", "pincode", "country", "phone"}
 	for _, f := range fields {
-		if v, ok := updates[f]; ok { set["addresses.$."+f] = v }
+		if v, ok := updates[f]; ok {
+			set["addresses.$."+f] = v
+		}
 	}
 
 	result, err := h.db.Collection("users").UpdateOne(ctx, bson.M{"_id": userID, "addresses.id": addressID}, bson.M{"$set": set})

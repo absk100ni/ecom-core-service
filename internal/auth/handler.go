@@ -32,7 +32,9 @@ func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
 }
 
 func (h *Handler) SendOTP(c *gin.Context) {
-	var req struct{ Phone string `json:"phone" binding:"required"` }
+	var req struct {
+		Phone string `json:"phone" binding:"required"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		log.WarnWithCode("SEND", errcodes.EAuthInvalidPhone.Code, "Invalid phone input", "err", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Phone required", "code": errcodes.EAuthInvalidPhone.Code})
@@ -62,7 +64,9 @@ func (h *Handler) SendOTP(c *gin.Context) {
 	log.Info("SEND", "OTP sent successfully", "phone", req.Phone)
 
 	resp := gin.H{"message": "OTP sent", "phone": req.Phone}
-	if h.cfg.Environment == "development" { resp["otp"] = code }
+	if h.cfg.Environment == "development" {
+		resp["otp"] = code
+	}
 	c.JSON(http.StatusOK, resp)
 }
 

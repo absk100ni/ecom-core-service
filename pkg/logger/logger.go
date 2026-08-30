@@ -42,22 +42,22 @@ var levelNames = map[Level]string{
 }
 
 var levelColors = map[Level]string{
-	LevelDebug: "\033[36m",  // Cyan
-	LevelInfo:  "\033[32m",  // Green
-	LevelWarn:  "\033[33m",  // Yellow
-	LevelError: "\033[31m",  // Red
-	LevelFatal: "\033[35m",  // Magenta
+	LevelDebug: "\033[36m", // Cyan
+	LevelInfo:  "\033[32m", // Green
+	LevelWarn:  "\033[33m", // Yellow
+	LevelError: "\033[31m", // Red
+	LevelFatal: "\033[35m", // Magenta
 }
 
 const colorReset = "\033[0m"
 
 // Global configuration
 var (
-	globalLevel   Level = LevelDebug
-	globalOutput  io.Writer = os.Stdout
-	globalColor   bool = true
-	globalJSON    bool = false
-	mu            sync.RWMutex
+	globalLevel  Level     = LevelDebug
+	globalOutput io.Writer = os.Stdout
+	globalColor  bool      = true
+	globalJSON   bool      = false
+	mu           sync.RWMutex
 )
 
 // SetLevel sets the global minimum log level
@@ -108,8 +108,8 @@ func SetJSONMode(enabled bool) {
 
 // Logger is a structured logger with hierarchical prefix context
 type Logger struct {
-	module    string // e.g., "AUTH"
-	subModule string // e.g., "OTP"
+	module    string        // e.g., "AUTH"
+	subModule string        // e.g., "OTP"
 	fields    []interface{} // persistent key-value pairs
 }
 

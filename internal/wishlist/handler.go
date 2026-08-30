@@ -35,17 +35,38 @@ func (h *Handler) Get(c *gin.Context) {
 		h.db.Collection("wishlists").InsertOne(ctx, wl)
 	}
 
-	// Enrich with product details
+	// Enrich with product details. Fetch all referenced products in ONE query ($in)
+	// instead of a FindOne per item (the previous N+1).
 	type enrichedItem struct {
 		models.WishlistItem
 		Product *models.Product `json:"product,omitempty"`
 	}
+
+	ids := make([]string, 0, len(wl.Items))
+	for _, item := range wl.Items {
+		ids = append(ids, item.ProductID)
+	}
+
+	productByID := make(map[string]*models.Product, len(ids))
+	if len(ids) > 0 {
+		cursor, qErr := h.db.Collection("products").Find(ctx, bson.M{"_id": bson.M{"$in": ids}, "is_active": true})
+		if qErr == nil {
+			var products []models.Product
+			cursor.All(ctx, &products)
+			cursor.Close(ctx)
+			for i := range products {
+				productByID[products[i].ID] = &products[i]
+			}
+		} else {
+			log.WarnWithCode("GET", errcodes.EWishGetFailed.Code, "Failed to batch-fetch wishlist products", "user_id", userID, "err", qErr)
+		}
+	}
+
 	enriched := make([]enrichedItem, 0, len(wl.Items))
 	for _, item := range wl.Items {
 		ei := enrichedItem{WishlistItem: item}
-		var p models.Product
-		if err := h.db.Collection("products").FindOne(ctx, bson.M{"_id": item.ProductID, "is_active": true}).Decode(&p); err == nil {
-			ei.Product = &p
+		if p, ok := productByID[item.ProductID]; ok {
+			ei.Product = p
 		}
 		enriched = append(enriched, ei)
 	}
@@ -56,7 +77,9 @@ func (h *Handler) Get(c *gin.Context) {
 // Add — POST /wishlist
 func (h *Handler) Add(c *gin.Context) {
 	userID := c.GetString("user_id")
-	var req struct{ ProductID string `json:"product_id" binding:"required"` }
+	var req struct {
+		ProductID string `json:"product_id" binding:"required"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "product_id required"})
 		return

@@ -37,8 +37,20 @@ func (h *Handler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Type must be 'percentage' or 'fixed'"})
 		return
 	}
-	if coupon.Type == "percentage" && coupon.Value > 100 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Percentage value cannot exceed 100"})
+	if coupon.Value <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Coupon value must be greater than 0"})
+		return
+	}
+	if coupon.Type == "percentage" && (coupon.Value < 1 || coupon.Value > 100) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Percentage discount must be between 1 and 100"})
+		return
+	}
+	if coupon.MaxDiscount < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Max discount cannot be negative"})
+		return
+	}
+	if coupon.MinOrder < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Minimum order cannot be negative"})
 		return
 	}
 
@@ -48,8 +60,12 @@ func (h *Handler) Create(c *gin.Context) {
 	coupon.UsedCount = 0
 	coupon.CreatedAt = time.Now()
 	coupon.UpdatedAt = time.Now()
-	if coupon.UsageLimit == 0 { coupon.UsageLimit = 1000 }
-	if coupon.ExpiresAt.IsZero() { coupon.ExpiresAt = time.Now().AddDate(0, 1, 0) }
+	if coupon.UsageLimit == 0 {
+		coupon.UsageLimit = 1000
+	}
+	if coupon.ExpiresAt.IsZero() {
+		coupon.ExpiresAt = time.Now().AddDate(0, 1, 0)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -74,8 +90,12 @@ func (h *Handler) List(c *gin.Context) {
 	defer cancel()
 
 	filter := bson.M{}
-	if c.Query("active") == "true" { filter["is_active"] = true }
-	if c.Query("active") == "false" { filter["is_active"] = false }
+	if c.Query("active") == "true" {
+		filter["is_active"] = true
+	}
+	if c.Query("active") == "false" {
+		filter["is_active"] = false
+	}
 
 	opts := options.Find().SetSort(bson.M{"created_at": -1})
 	cursor, err := h.db.Collection("coupons").Find(ctx, filter, opts)
@@ -87,7 +107,9 @@ func (h *Handler) List(c *gin.Context) {
 
 	var coupons []models.Coupon
 	cursor.All(ctx, &coupons)
-	if coupons == nil { coupons = []models.Coupon{} }
+	if coupons == nil {
+		coupons = []models.Coupon{}
+	}
 	c.JSON(http.StatusOK, gin.H{"coupons": coupons, "total": len(coupons)})
 }
 
@@ -117,6 +139,36 @@ func (h *Handler) Update(c *gin.Context) {
 	delete(updates, "id")
 	if code, ok := updates["code"].(string); ok {
 		updates["code"] = strings.ToUpper(strings.TrimSpace(code))
+	}
+
+	// P0-5c: Validate coupon update fields
+	if val, ok := updates["value"]; ok {
+		if v, ok := val.(float64); ok && v <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Coupon value must be greater than 0"})
+			return
+		}
+	}
+	if t, ok := updates["type"]; ok {
+		if ts, ok := t.(string); ok && ts != "percentage" && ts != "fixed" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Type must be 'percentage' or 'fixed'"})
+			return
+		}
+	}
+	if val, ok := updates["value"]; ok {
+		if v, ok := val.(float64); ok {
+			if t, tok := updates["type"]; tok {
+				if ts, ok := t.(string); ok && ts == "percentage" && (v < 1 || v > 100) {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Percentage discount must be between 1 and 100"})
+					return
+				}
+			}
+		}
+	}
+	if md, ok := updates["max_discount"]; ok {
+		if v, ok := md.(float64); ok && v < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Max discount cannot be negative"})
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -184,12 +236,17 @@ func (h *Handler) Validate(c *gin.Context) {
 	discount := 0
 	if coupon.Type == "percentage" {
 		discount = req.Subtotal * coupon.Value / 100
+		if rem := discount % 100; rem != 0 {
+			discount += 100 - rem // whole rupees — must match order-create rounding
+		}
 		if coupon.MaxDiscount > 0 && discount > coupon.MaxDiscount {
 			discount = coupon.MaxDiscount
 		}
 	} else {
 		discount = coupon.Value
-		if discount > req.Subtotal { discount = req.Subtotal }
+		if discount > req.Subtotal {
+			discount = req.Subtotal
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

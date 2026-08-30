@@ -2,6 +2,8 @@
 
 A complete, production-ready e-commerce backend in Go/Gin/MongoDB. Powers the entire e-commerce platform with Product Catalog, Cart, Orders, Payments (Razorpay), Shipping (Shiprocket), Auth (OTP/JWT), Reviews, Wishlist, Coupons, and Admin APIs.
 
+📄 **[Database Design Documentation](DATABASE_DESIGN.md)** — full schema, indexes, scaling rationale, and ER diagram.
+
 ## 🚀 Quick Start
 
 ```bash

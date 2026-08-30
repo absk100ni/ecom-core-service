@@ -8,6 +8,8 @@ type User struct {
 	Phone     string    `json:"phone" bson:"phone"`
 	Email     string    `json:"email,omitempty" bson:"email,omitempty"`
 	Name      string    `json:"name,omitempty" bson:"name,omitempty"`
+	Avatar    string    `json:"avatar,omitempty" bson:"avatar,omitempty"`
+	GoogleSub string    `json:"google_sub,omitempty" bson:"google_sub,omitempty"`
 	IsAdmin   bool      `json:"is_admin" bson:"is_admin"`
 	Addresses []Address `json:"addresses,omitempty" bson:"addresses,omitempty"`
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
@@ -25,41 +27,46 @@ type OTP struct {
 
 // ==================== PRODUCT ====================
 type Product struct {
-	ID          string    `json:"id" bson:"_id,omitempty"`
-	Name        string    `json:"name" bson:"name" binding:"required"`
-	Slug        string    `json:"slug" bson:"slug"`
-	Description string    `json:"description" bson:"description"`
-	Category    string    `json:"category" bson:"category" binding:"required"`
-	Price       int       `json:"price" bson:"price" binding:"required,gt=0"` // in paise
-	CompareAt   int       `json:"compare_at_price,omitempty" bson:"compare_at_price,omitempty"`
-	Images      []string  `json:"images" bson:"images"`
-	Thumbnail   string    `json:"thumbnail" bson:"thumbnail"`
-	Variants    []Variant `json:"variants" bson:"variants"`
-	Tags        []string  `json:"tags,omitempty" bson:"tags,omitempty"`
-	IsActive    bool      `json:"is_active" bson:"is_active"`
-	Stock       int       `json:"stock" bson:"stock" binding:"gte=0"`
-	SKU         string    `json:"sku" bson:"sku"`
-	Weight      int       `json:"weight,omitempty" bson:"weight,omitempty"` // grams
-	CreatedAt   time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" bson:"updated_at"`
+	ID             string    `json:"id" bson:"_id,omitempty"`
+	Name           string    `json:"name" bson:"name" binding:"required"`
+	Slug           string    `json:"slug" bson:"slug"`
+	Description    string    `json:"description" bson:"description"`
+	Category       string    `json:"category" bson:"category" binding:"required"`
+	Price          int       `json:"price" bson:"price" binding:"required,gt=0"` // in paise
+	CompareAt      int       `json:"compare_at_price,omitempty" bson:"compare_at_price,omitempty"`
+	Images         []string  `json:"images" bson:"images"`
+	Thumbnail      string    `json:"thumbnail" bson:"thumbnail"`
+	Variants       []Variant `json:"variants" bson:"variants"`
+	Tags           []string  `json:"tags,omitempty" bson:"tags,omitempty"`
+	IsActive       bool      `json:"is_active" bson:"is_active"`
+	Stock          int       `json:"stock" bson:"stock" binding:"gte=0"`
+	SKU            string    `json:"sku" bson:"sku"`
+	Weight         int       `json:"weight,omitempty" bson:"weight,omitempty"`                   // grams
+	AdvancePercent *int      `json:"advance_percent,omitempty" bson:"advance_percent,omitempty"` // 0-100, nil=global default
+	GSTPercent     int       `json:"gst_percent,omitempty" bson:"gst_percent,omitempty"`         // per-product GST rate, 0=use default
+	HSNCode        string    `json:"hsn_code,omitempty" bson:"hsn_code,omitempty"`               // HSN/SAC code
+	CreatedAt      time.Time `json:"created_at" bson:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" bson:"updated_at"`
 }
 
 type Variant struct {
 	ID    string `json:"id" bson:"id"`
-	Name  string `json:"name" bson:"name"`  // e.g. "Size", "Color"
+	Name  string `json:"name" bson:"name"`   // e.g. "Size", "Color"
 	Value string `json:"value" bson:"value"` // e.g. "XL", "Black"
 	Stock int    `json:"stock" bson:"stock"`
 	Price int    `json:"price,omitempty" bson:"price,omitempty"` // override price
 }
 
 type Category struct {
-	ID       string    `json:"id" bson:"_id,omitempty"`
-	Name     string    `json:"name" bson:"name" binding:"required"`
-	Slug     string    `json:"slug" bson:"slug"`
-	ParentID string    `json:"parent_id,omitempty" bson:"parent_id,omitempty"`
-	Image    string    `json:"image,omitempty" bson:"image,omitempty"`
-	IsActive bool      `json:"is_active" bson:"is_active"`
-	SortOrder int      `json:"sort_order" bson:"sort_order"`
+	ID        string    `json:"id" bson:"_id,omitempty"`
+	Name      string    `json:"name" bson:"name" binding:"required"`
+	Slug      string    `json:"slug" bson:"slug"`
+	ParentID  string    `json:"parent_id,omitempty" bson:"parent_id,omitempty"`
+	Level     int       `json:"level" bson:"level"`                   // 1=root, 2=sub, 3=sub-sub (max)
+	Path      string    `json:"path,omitempty" bson:"path,omitempty"` // materialized path of ancestor IDs, e.g. "rootID/subID"
+	Image     string    `json:"image,omitempty" bson:"image,omitempty"`
+	IsActive  bool      `json:"is_active" bson:"is_active"`
+	SortOrder int       `json:"sort_order" bson:"sort_order"`
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
 }
@@ -91,8 +98,15 @@ type Order struct {
 	Subtotal        int         `json:"subtotal" bson:"subtotal"`
 	ShippingCost    int         `json:"shipping_cost" bson:"shipping_cost"`
 	Discount        int         `json:"discount" bson:"discount"`
-	Total           int         `json:"total" bson:"total"` // in paise
+	Total           int         `json:"total" bson:"total"`                                   // in paise
+	PaymentPlan     string      `json:"payment_plan,omitempty" bson:"payment_plan,omitempty"` // "full" or "partial"
+	AdvanceAmount   int         `json:"advance_amount,omitempty" bson:"advance_amount,omitempty"`
+	CODAmount       int         `json:"cod_amount,omitempty" bson:"cod_amount,omitempty"`
+	CODCollected    bool        `json:"cod_collected" bson:"cod_collected"`
 	CouponCode      string      `json:"coupon_code,omitempty" bson:"coupon_code,omitempty"`
+	CouponUsed      bool        `json:"coupon_used" bson:"coupon_used"`             // true if coupon usage was incremented
+	CouponReleased  bool        `json:"coupon_released" bson:"coupon_released"`     // true if coupon usage was decremented back
+	StockReleased   bool        `json:"stock_released" bson:"stock_released"`       // true if stock was restored on cancel/expire
 	Status          string      `json:"status" bson:"status"`
 	PaymentStatus   string      `json:"payment_status" bson:"payment_status"`
 	PaymentMethod   string      `json:"payment_method,omitempty" bson:"payment_method,omitempty"`
@@ -102,12 +116,16 @@ type Order struct {
 	TrackingID      string      `json:"tracking_id,omitempty" bson:"tracking_id,omitempty"`
 	TrackingURL     string      `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
 	ShipmentID      string      `json:"shipment_id,omitempty" bson:"shipment_id,omitempty"`
+	IsGuest         bool        `json:"is_guest" bson:"is_guest"`
 	Notes           string      `json:"notes,omitempty" bson:"notes,omitempty"`
 	CancelReason    string      `json:"cancel_reason,omitempty" bson:"cancel_reason,omitempty"`
 	CancelledAt     *time.Time  `json:"cancelled_at,omitempty" bson:"cancelled_at,omitempty"`
 	RefundID        string      `json:"refund_id,omitempty" bson:"refund_id,omitempty"`
 	RefundAmount    int         `json:"refund_amount,omitempty" bson:"refund_amount,omitempty"`
 	RefundedAt      *time.Time  `json:"refunded_at,omitempty" bson:"refunded_at,omitempty"`
+	DeliveredAt     *time.Time  `json:"delivered_at,omitempty" bson:"delivered_at,omitempty"`
+	InvoiceNumber   string      `json:"invoice_number,omitempty" bson:"invoice_number,omitempty"`
+	InvoiceDate     *time.Time  `json:"invoice_date,omitempty" bson:"invoice_date,omitempty"`
 	CreatedAt       time.Time   `json:"created_at" bson:"created_at"`
 	UpdatedAt       time.Time   `json:"updated_at" bson:"updated_at"`
 }
@@ -123,17 +141,17 @@ type OrderItem struct {
 }
 
 type Address struct {
-	ID      string `json:"id,omitempty" bson:"id,omitempty"`
-	Label   string `json:"label,omitempty" bson:"label,omitempty"` // Home, Office, etc.
-	Name    string `json:"name" bson:"name"`
-	Line1   string `json:"line1" bson:"line1"`
-	Line2   string `json:"line2,omitempty" bson:"line2,omitempty"`
-	City    string `json:"city" bson:"city"`
-	State   string `json:"state" bson:"state"`
-	Pincode string `json:"pincode" bson:"pincode"`
-	Country string `json:"country,omitempty" bson:"country,omitempty"`
-	Phone   string `json:"phone" bson:"phone"`
-	IsDefault bool `json:"is_default,omitempty" bson:"is_default,omitempty"`
+	ID        string `json:"id,omitempty" bson:"id,omitempty"`
+	Label     string `json:"label,omitempty" bson:"label,omitempty"` // Home, Office, etc.
+	Name      string `json:"name" bson:"name"`
+	Line1     string `json:"line1" bson:"line1"`
+	Line2     string `json:"line2,omitempty" bson:"line2,omitempty"`
+	City      string `json:"city" bson:"city"`
+	State     string `json:"state" bson:"state"`
+	Pincode   string `json:"pincode" bson:"pincode"`
+	Country   string `json:"country,omitempty" bson:"country,omitempty"`
+	Phone     string `json:"phone" bson:"phone"`
+	IsDefault bool   `json:"is_default,omitempty" bson:"is_default,omitempty"`
 }
 
 // ==================== PAYMENT ====================
@@ -154,20 +172,39 @@ type Payment struct {
 
 // ==================== SHIPPING ====================
 type Shipment struct {
-	ID             string    `json:"id" bson:"_id,omitempty"`
-	OrderID        string    `json:"order_id" bson:"order_id"`
-	Provider       string    `json:"provider" bson:"provider"` // shiprocket, delhivery
-	ShipmentID     string    `json:"shipment_id" bson:"shipment_id"`
-	AWB            string    `json:"awb,omitempty" bson:"awb,omitempty"`
-	TrackingURL    string    `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
-	Status         string    `json:"status" bson:"status"`
-	EstDelivery    string    `json:"est_delivery,omitempty" bson:"est_delivery,omitempty"`
-	Weight         int       `json:"weight" bson:"weight"`
-	Length         int       `json:"length" bson:"length"`
-	Width          int       `json:"width" bson:"width"`
-	Height         int       `json:"height" bson:"height"`
-	CreatedAt      time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at" bson:"updated_at"`
+	ID          string          `json:"id" bson:"_id,omitempty"`
+	OrderID     string          `json:"order_id" bson:"order_id"`
+	Provider    string          `json:"provider" bson:"provider"`
+	ShipmentID  string          `json:"shipment_id" bson:"shipment_id"`
+	AWB         string          `json:"awb,omitempty" bson:"awb,omitempty"`
+	CourierName string          `json:"courier_name,omitempty" bson:"courier_name,omitempty"`
+	TrackingURL string          `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
+	LabelURL    string          `json:"label_url,omitempty" bson:"label_url,omitempty"`
+	Status      string          `json:"status" bson:"status"`
+	Events      []TrackingEvent `json:"events,omitempty" bson:"events,omitempty"`
+	EstDelivery string          `json:"est_delivery,omitempty" bson:"est_delivery,omitempty"`
+	Weight      int             `json:"weight" bson:"weight"`
+	Length      int             `json:"length" bson:"length"`
+	Width       int             `json:"width" bson:"width"`
+	Height      int             `json:"height" bson:"height"`
+	CreatedAt   time.Time       `json:"created_at" bson:"created_at"`
+	UpdatedAt   time.Time       `json:"updated_at" bson:"updated_at"`
+}
+
+type TrackingEvent struct {
+	Status      string    `json:"status" bson:"status"`
+	Description string    `json:"description" bson:"description"`
+	Timestamp   time.Time `json:"timestamp" bson:"timestamp"`
+}
+
+// ==================== ADMIN ====================
+type Admin struct {
+	ID           string    `json:"id" bson:"_id,omitempty"`
+	Email        string    `json:"email" bson:"email"`
+	Name         string    `json:"name" bson:"name"`
+	PasswordHash string    `json:"-" bson:"password_hash"`
+	CreatedAt    time.Time `json:"created_at" bson:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" bson:"updated_at"`
 }
 
 // ==================== INVENTORY ====================
@@ -184,19 +221,19 @@ type InventoryItem struct {
 
 // ==================== COUPON ====================
 type Coupon struct {
-	ID           string    `json:"id" bson:"_id,omitempty"`
-	Code         string    `json:"code" bson:"code" binding:"required"`
-	Type         string    `json:"type" bson:"type" binding:"required"` // percentage, fixed
-	Value        int       `json:"value" bson:"value" binding:"required,gt=0"`
-	MinOrder     int       `json:"min_order" bson:"min_order"`
-	MaxDiscount  int       `json:"max_discount,omitempty" bson:"max_discount,omitempty"`
-	UsageLimit   int       `json:"usage_limit" bson:"usage_limit"`
-	UsedCount    int       `json:"used_count" bson:"used_count"`
-	IsActive     bool      `json:"is_active" bson:"is_active"`
-	Description  string    `json:"description,omitempty" bson:"description,omitempty"`
-	ExpiresAt    time.Time `json:"expires_at" bson:"expires_at"`
-	CreatedAt    time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" bson:"updated_at"`
+	ID          string    `json:"id" bson:"_id,omitempty"`
+	Code        string    `json:"code" bson:"code" binding:"required"`
+	Type        string    `json:"type" bson:"type" binding:"required"` // percentage, fixed
+	Value       int       `json:"value" bson:"value" binding:"required,gt=0"`
+	MinOrder    int       `json:"min_order" bson:"min_order"`
+	MaxDiscount int       `json:"max_discount,omitempty" bson:"max_discount,omitempty"`
+	UsageLimit  int       `json:"usage_limit" bson:"usage_limit"`
+	UsedCount   int       `json:"used_count" bson:"used_count"`
+	IsActive    bool      `json:"is_active" bson:"is_active"`
+	Description string    `json:"description,omitempty" bson:"description,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at" bson:"expires_at"`
+	CreatedAt   time.Time `json:"created_at" bson:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" bson:"updated_at"`
 }
 
 // ==================== WISHLIST ====================
@@ -215,20 +252,20 @@ type WishlistItem struct {
 
 // ==================== REVIEWS ====================
 type Review struct {
-	ID        string    `json:"id" bson:"_id,omitempty"`
-	ProductID string    `json:"product_id" bson:"product_id" binding:"required"`
-	UserID    string    `json:"user_id" bson:"user_id"`
-	UserName  string    `json:"user_name" bson:"user_name"`
-	UserPhone string    `json:"user_phone" bson:"user_phone"`
-	OrderID   string    `json:"order_id,omitempty" bson:"order_id,omitempty"`
-	Rating    int       `json:"rating" bson:"rating" binding:"required,gte=1,lte=5"`
-	Title     string    `json:"title,omitempty" bson:"title,omitempty"`
-	Comment   string    `json:"comment,omitempty" bson:"comment,omitempty"`
-	Images    []string  `json:"images,omitempty" bson:"images,omitempty"`
-	IsVerified bool     `json:"is_verified" bson:"is_verified"` // verified purchase
-	IsApproved bool     `json:"is_approved" bson:"is_approved"` // admin moderation
-	CreatedAt time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
+	ID         string    `json:"id" bson:"_id,omitempty"`
+	ProductID  string    `json:"product_id" bson:"product_id" binding:"required"`
+	UserID     string    `json:"user_id" bson:"user_id"`
+	UserName   string    `json:"user_name" bson:"user_name"`
+	UserPhone  string    `json:"user_phone" bson:"user_phone"`
+	OrderID    string    `json:"order_id,omitempty" bson:"order_id,omitempty"`
+	Rating     int       `json:"rating" bson:"rating" binding:"required,gte=1,lte=5"`
+	Title      string    `json:"title,omitempty" bson:"title,omitempty"`
+	Comment    string    `json:"comment,omitempty" bson:"comment,omitempty"`
+	Images     []string  `json:"images,omitempty" bson:"images,omitempty"`
+	IsVerified bool      `json:"is_verified" bson:"is_verified"` // verified purchase
+	IsApproved bool      `json:"is_approved" bson:"is_approved"` // admin moderation
+	CreatedAt  time.Time `json:"created_at" bson:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at" bson:"updated_at"`
 }
 
 // ==================== UPLOAD ====================
@@ -237,4 +274,27 @@ type UploadResponse struct {
 	PublicURL string `json:"public_url"`
 	Key       string `json:"key"`
 	ExpiresIn int    `json:"expires_in"`
+}
+
+// ==================== INVOICE (fields on Order) ====================
+// InvoiceNumber and InvoiceDate are stored on Order (see Order struct additions)
+
+// ==================== RETURN REQUEST ====================
+type ReturnRequest struct {
+	ID        string       `json:"id" bson:"_id,omitempty"`
+	OrderID   string       `json:"order_id" bson:"order_id"`
+	UserID    string       `json:"user_id" bson:"user_id"`
+	Items     []ReturnItem `json:"items" bson:"items"`
+	Type      string       `json:"type" bson:"type"`     // "return" or "replacement"
+	Status    string       `json:"status" bson:"status"` // requested|approved|rejected|completed
+	Comment   string       `json:"comment,omitempty" bson:"comment,omitempty"`
+	AdminNote string       `json:"admin_note,omitempty" bson:"admin_note,omitempty"`
+	CreatedAt time.Time    `json:"created_at" bson:"created_at"`
+	UpdatedAt time.Time    `json:"updated_at" bson:"updated_at"`
+}
+
+type ReturnItem struct {
+	ProductID string `json:"product_id" bson:"product_id"`
+	Qty       int    `json:"qty" bson:"qty"`
+	Reason    string `json:"reason" bson:"reason"`
 }

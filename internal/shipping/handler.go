@@ -1,15 +1,15 @@
 package shipping
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
+	"crypto/subtle"
 	"net/http"
 	"time"
 
 	"ecom-core-service/internal/config"
 	"ecom-core-service/internal/models"
+	"ecom-core-service/internal/notify"
+	"ecom-core-service/pkg/cache"
 	"ecom-core-service/pkg/errcodes"
 	"ecom-core-service/pkg/logger"
 
@@ -23,131 +23,243 @@ var log = logger.New("SHIPPING", "LOGISTICS")
 var _ = errcodes.EShipCreateFailed
 
 type Handler struct {
-	db  *mongo.Database
-	cfg *config.Config
+	db       *mongo.Database
+	cfg      *config.Config
+	cache    *cache.Cache
+	provider CourierProvider
+	notifier *notify.Notifier
 }
 
-func NewHandler(db *mongo.Database, cfg *config.Config) *Handler { return &Handler{db: db, cfg: cfg} }
+func NewHandler(db *mongo.Database, cfg *config.Config, c *cache.Cache) *Handler {
+	return &Handler{db: db, cfg: cfg, cache: c, provider: ProviderFromConfig(cfg)}
+}
 
-// CreateShipment — POST /admin/shipping/create
+// WithNotifier injects the notification service (optional — nil means no notifications).
+func (h *Handler) WithNotifier(n *notify.Notifier) *Handler { h.notifier = n; return h }
+
+// CreateShipment — POST /api/v1/admin/orders/:id/ship (IDEMPOTENT)
 func (h *Handler) CreateShipment(c *gin.Context) {
-	var req struct {
-		OrderID string `json:"order_id" binding:"required"`
-		Weight  int    `json:"weight"`
-		Length  int    `json:"length"`
-		Width   int    `json:"width"`
-		Height  int    `json:"height"`
+	orderID := c.Param("id")
+	if orderID == "" {
+		// Fallback for old route /admin/shipping/create
+		var req struct {
+			OrderID string `json:"order_id" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "order_id required"})
+			return
+		}
+		orderID = req.OrderID
 	}
-	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": "order_id required"}); return }
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	var order models.Order
-	if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": req.OrderID}).Decode(&order); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
+	// Check for existing shipment (idempotent)
+	var existingShipment models.Shipment
+	if err := h.db.Collection("shipments").FindOne(ctx, bson.M{"order_id": orderID}).Decode(&existingShipment); err == nil {
+		log.Warn("SHIP", "Order already shipped — idempotent reject", "order_id", orderID, "awb", existingShipment.AWB)
+		c.JSON(http.StatusConflict, gin.H{"error": errcodes.EShprAlreadyShipped.Message, "code": errcodes.EShprAlreadyShipped.Code, "shipment": existingShipment})
 		return
 	}
 
-	if req.Weight == 0 { req.Weight = 500 }
-	if req.Length == 0 { req.Length = 30 }
-	if req.Width == 0 { req.Width = 25 }
-	if req.Height == 0 { req.Height = 5 }
+	var order models.Order
+	if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": orderID}).Decode(&order); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found", "code": errcodes.EOrdNotFound.Code})
+		return
+	}
+
+	// Validate: order must be confirmed and advance paid
+	if order.Status != "confirmed" && order.Status != "processing" {
+		log.WarnWithCode("SHIP", errcodes.EShprNotReady.Code, "Order not ready to ship", "order_id", orderID, "status", order.Status)
+		c.JSON(http.StatusBadRequest, gin.H{"error": errcodes.EShprNotReady.Message, "code": errcodes.EShprNotReady.Code})
+		return
+	}
+	if order.PaymentStatus != "paid" && order.AdvanceAmount > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Advance payment not received", "code": errcodes.EShprNotReady.Code})
+		return
+	}
+
+	// Determine payment type and COD amount
+	paymentType := "PREPAID"
+	codAmount := 0
+	if order.CODAmount > 0 {
+		paymentType = "COD"
+		codAmount = order.CODAmount
+	}
+
+	// Call provider
+	result, err := h.provider.CreateShipment(ctx, ShipmentRequest{
+		OrderNumber:    order.OrderNumber,
+		OrderDate:      order.CreatedAt,
+		PaymentType:    paymentType,
+		CODAmountPaise: codAmount,
+		CustomerName:   order.ShippingAddress.Name,
+		CustomerPhone:  order.ShippingAddress.Phone,
+		Address:        order.ShippingAddress,
+		Items:          order.Items,
+		WeightGrams:    500, // default
+		LengthCM:       30,
+		WidthCM:        25,
+		HeightCM:       5,
+	})
+	if err != nil {
+		log.ErrorWithCode("SHIP", errcodes.EShipCreateFailed.Code, "Provider shipment creation failed", "order_id", orderID, "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errcodes.EShipCreateFailed.Message, "code": errcodes.EShipCreateFailed.Code})
+		return
+	}
 
 	shipment := models.Shipment{
-		ID: uuid.New().String(), OrderID: order.ID, Provider: "shiprocket",
-		Status: "created", Weight: req.Weight, Length: req.Length, Width: req.Width, Height: req.Height,
-		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		ID:          uuid.New().String(),
+		OrderID:     order.ID,
+		Provider:    "shipmozo",
+		AWB:         result.AWB,
+		CourierName: result.CourierName,
+		TrackingURL: result.TrackingURL,
+		LabelURL:    result.LabelURL,
+		Status:      "booked",
+		Weight:      500,
+		Length:      30,
+		Width:       25,
+		Height:      5,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
 	}
-
-	// Call Shiprocket API if configured
-	if h.cfg.ShiprocketToken != "" {
-		srID, awb, trackURL, err := h.createShiprocketShipment(order, shipment)
-		if err != nil {
-			log.Error("CreateShipment", "Shiprocket API error", "err", err.Error())
-		} else {
-			shipment.ShipmentID = srID
-			shipment.AWB = awb
-			shipment.TrackingURL = trackURL
-			shipment.Status = "booked"
-		}
-	} else {
-		// Mock shipment
-		shipment.ShipmentID = "MOCK-" + uuid.New().String()[:8]
-		shipment.AWB = "AWB" + fmt.Sprintf("%010d", time.Now().UnixNano()%10000000000)
-		shipment.TrackingURL = fmt.Sprintf("https://track.example.com/%s", shipment.AWB)
-		shipment.Status = "booked"
-		log.Info("CreateShipment", "Mock shipment created", "shipment_id", shipment.ShipmentID, "order_id", order.ID)
-	}
-
 	h.db.Collection("shipments").InsertOne(ctx, shipment)
 
-	// Update order with tracking info
-	h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": order.ID}, bson.M{"$set": bson.M{
-		"tracking_id": shipment.AWB, "tracking_url": shipment.TrackingURL,
-		"shipment_id": shipment.ShipmentID, "status": "shipped", "updated_at": time.Now(),
-	}})
+	// Update order to shipped state-machine-safely (only if still confirmed/processing)
+	h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": order.ID, "status": bson.M{"$in": []string{"confirmed", "processing"}}},
+		bson.M{"$set": bson.M{
+			"tracking_id": shipment.AWB, "tracking_url": shipment.TrackingURL,
+			"shipment_id": shipment.ID, "status": "shipped", "updated_at": time.Now(),
+		}})
+
+	log.Info("SHIP", "Shipment created", "order_id", order.ID, "awb", result.AWB, "courier", result.CourierName)
+
+	if h.notifier != nil {
+		// Guest orders have no user record — empty user is fine: email skips,
+		// WhatsApp goes to order.ShippingAddress.Phone.
+		var user models.User
+		if order.UserID != "" {
+			h.db.Collection("users").FindOne(ctx, bson.M{"_id": order.UserID}).Decode(&user)
+		}
+		h.notifier.OrderShipped(&order, &user, result.AWB, result.CourierName, result.TrackingURL)
+	}
 
 	c.JSON(http.StatusCreated, shipment)
 }
 
-// TrackShipment — GET /shipping/track/:orderId
+// Track — GET /api/v1/orders/:id/tracking (authenticated, owner-only)
 func (h *Handler) Track(c *gin.Context) {
-	orderID := c.Param("orderId")
+	orderID := c.Param("id")
+	if orderID == "" {
+		orderID = c.Param("orderId")
+	}
+	userID := c.GetString("user_id")
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var shipment models.Shipment
-	if err := h.db.Collection("shipments").FindOne(ctx, bson.M{"order_id": orderID}).Decode(&shipment); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Shipment not found"})
+	// Verify ownership
+	var order models.Order
+	if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": orderID, "user_id": userID}).Decode(&order); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found", "code": errcodes.EOrdNotFound.Code})
 		return
 	}
-	c.JSON(http.StatusOK, shipment)
+
+	var shipment models.Shipment
+	if err := h.db.Collection("shipments").FindOne(ctx, bson.M{"order_id": orderID}).Decode(&shipment); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Shipment not found", "code": errcodes.EShipNotFound.Code})
+		return
+	}
+
+	events := shipment.Events
+	if events == nil {
+		events = []models.TrackingEvent{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":       shipment.Status,
+		"awb":          shipment.AWB,
+		"courier":      shipment.CourierName,
+		"tracking_url": shipment.TrackingURL,
+		"events":       events,
+	})
 }
 
-func (h *Handler) createShiprocketShipment(order models.Order, ship models.Shipment) (string, string, string, error) {
-	// Build Shiprocket API request
-	items := make([]map[string]interface{}, 0)
-	for _, item := range order.Items {
-		items = append(items, map[string]interface{}{
-			"name": item.Name, "sku": item.SKU, "units": item.Quantity,
-			"selling_price": fmt.Sprintf("%.2f", float64(item.Price)/100), "discount": "0",
+// Webhook — POST /shipping/webhook (authenticated via x-api-key, updates shipment by AWB)
+func (h *Handler) Webhook(c *gin.Context) {
+	if h.cfg.ShippingWebhookToken != "" {
+		got := c.GetHeader("x-api-key")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(h.cfg.ShippingWebhookToken)) != 1 {
+			log.WarnWithCode("WEBHOOK", errcodes.EShipWebhookFailed.Code, "Invalid shipping webhook token", "ip", c.ClientIP())
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			return
+		}
+	} else if h.cfg.Environment == "production" {
+		log.ErrorWithCode("WEBHOOK", errcodes.EShipWebhookFailed.Code, "SHIPPING_WEBHOOK_TOKEN not set in production — rejecting webhook")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Webhook not configured"})
+		return
+	}
+
+	var payload struct {
+		AWB           string `json:"awb"`
+		CurrentStatus string `json:"current_status"`
+		Description   string `json:"description"`
+		Timestamp     string `json:"timestamp"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload"})
+		return
+	}
+	if payload.AWB == "" || payload.CurrentStatus == "" {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ts, _ := time.Parse(time.RFC3339, payload.Timestamp)
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	event := models.TrackingEvent{
+		Status:      payload.CurrentStatus,
+		Description: payload.Description,
+		Timestamp:   ts,
+	}
+
+	// Update shipment status and append event
+	res, err := h.db.Collection("shipments").UpdateOne(ctx,
+		bson.M{"awb": payload.AWB},
+		bson.M{
+			"$set":  bson.M{"status": payload.CurrentStatus, "updated_at": time.Now()},
+			"$push": bson.M{"events": event},
 		})
+	if err != nil {
+		log.ErrorWithCode("WEBHOOK", errcodes.EShipWebhookFailed.Code, "Failed to update shipment", "awb", payload.AWB, "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Update failed"})
+		return
 	}
 
-	payload := map[string]interface{}{
-		"order_id":         order.OrderNumber,
-		"order_date":       order.CreatedAt.Format("2006-01-02 15:04:05"),
-		"billing_customer_name": order.ShippingAddress.Name,
-		"billing_address":       order.ShippingAddress.Line1,
-		"billing_city":          order.ShippingAddress.City,
-		"billing_pincode":       order.ShippingAddress.Pincode,
-		"billing_state":         order.ShippingAddress.State,
-		"billing_country":       "India",
-		"billing_phone":         order.ShippingAddress.Phone,
-		"shipping_is_billing":   true,
-		"order_items":           items,
-		"payment_method":        "Prepaid",
-		"sub_total":             float64(order.Total) / 100,
-		"length": ship.Length, "breadth": ship.Width, "height": ship.Height, "weight": float64(ship.Weight) / 1000,
+	// On delivered: update order + mark COD collected + set delivered_at
+	if payload.CurrentStatus == "delivered" && res.MatchedCount > 0 {
+		var shipment models.Shipment
+		h.db.Collection("shipments").FindOne(ctx, bson.M{"awb": payload.AWB}).Decode(&shipment)
+		if shipment.OrderID != "" {
+			now := time.Now()
+			update := bson.M{"status": "delivered", "updated_at": now, "delivered_at": now}
+			// Mark COD collected if there was a COD amount
+			var order models.Order
+			if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": shipment.OrderID}).Decode(&order); err == nil && order.CODAmount > 0 {
+				update["cod_collected"] = true
+			}
+			h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": shipment.OrderID}, bson.M{"$set": update})
+		}
 	}
 
-	data, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", "https://apiv2.shiprocket.in/v1/external/orders/create/adhoc", bytes.NewBuffer(data))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+h.cfg.ShiprocketToken)
-
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil { return "", "", "", err }
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	shipmentID := fmt.Sprintf("%v", result["shipment_id"])
-	awb := ""
-	trackURL := ""
-	if sid, ok := result["shipment_id"]; ok { shipmentID = fmt.Sprintf("%v", sid) }
-
-	return shipmentID, awb, trackURL, nil
+	log.Info("WEBHOOK", "Shipment status updated", "awb", payload.AWB, "status", payload.CurrentStatus, "matched", res.MatchedCount)
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

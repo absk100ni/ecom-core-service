@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"sync"
@@ -72,7 +73,20 @@ func AdminMiddleware() gin.HandlerFunc {
 	}
 }
 
-func RateLimitMiddleware(maxReq int, window time.Duration) gin.HandlerFunc {
+// rateLimiter is the subset of pkg/cache.Cache the middleware needs. Declaring it as an
+// interface here keeps the middleware package free of a direct cache/redis dependency and
+// makes the limiter trivially testable.
+type rateLimiter interface {
+	RateAllow(ctx context.Context, key string, limit int, window time.Duration) (allowed bool, counted bool)
+}
+
+// RateLimitMiddleware limits requests per client IP to maxReq per window.
+//
+// When a shared limiter (Redis) is provided it enforces the limit consistently across all
+// app instances — the prerequisite for running more than one replica. If Redis is absent
+// or unreachable it transparently falls back to a per-process in-memory token-bucket, so a
+// single instance (or a Redis outage) still gets local protection rather than failing open.
+func RateLimitMiddleware(shared rateLimiter, maxReq int, window time.Duration) gin.HandlerFunc {
 	type client struct {
 		limiter  *rate.Limiter
 		lastSeen time.Time
@@ -91,8 +105,8 @@ func RateLimitMiddleware(maxReq int, window time.Duration) gin.HandlerFunc {
 			mu.Unlock()
 		}
 	}()
-	return func(c *gin.Context) {
-		ip := c.ClientIP()
+
+	localAllow := func(ip string) bool {
 		mu.Lock()
 		if _, ok := clients[ip]; !ok {
 			clients[ip] = &client{limiter: rate.NewLimiter(rate.Every(window/time.Duration(maxReq)), maxReq)}
@@ -100,7 +114,25 @@ func RateLimitMiddleware(maxReq int, window time.Duration) gin.HandlerFunc {
 		clients[ip].lastSeen = time.Now()
 		l := clients[ip].limiter
 		mu.Unlock()
-		if !l.Allow() {
+		return l.Allow()
+	}
+
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+
+		allowed := true
+		if shared != nil {
+			ok, counted := shared.RateAllow(c.Request.Context(), "ratelimit:"+ip, maxReq, window)
+			if counted {
+				allowed = ok
+			} else {
+				allowed = localAllow(ip) // Redis unavailable — fall back to local bucket
+			}
+		} else {
+			allowed = localAllow(ip)
+		}
+
+		if !allowed {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded"})
 			return
 		}

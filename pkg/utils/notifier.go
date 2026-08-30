@@ -89,9 +89,9 @@ func SendOrderSMS(phone, message string) {
 func sendViaMSG91(phone, message string) error {
 	// MSG91 Send SMS API
 	payload := map[string]interface{}{
-		"sender":      msg91SenderID,
-		"route":       "4", // Transactional route
-		"country":     "91",
+		"sender":  msg91SenderID,
+		"route":   "4", // Transactional route
+		"country": "91",
 		"sms": []map[string]interface{}{
 			{
 				"message": message,

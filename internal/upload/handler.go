@@ -28,64 +28,75 @@ func NewHandler(cfg *config.Config) *Handler {
 	return &Handler{cfg: cfg}
 }
 
-// PresignedURL — POST /admin/upload/presigned-url
-// Returns a pre-signed S3 URL for direct browser upload
+// PresignedURL — POST /admin/uploads/presign
+// When S3_BUCKET is set, returns a properly-formed presigned URL pattern.
+// TODO: integrate github.com/aws/aws-sdk-go-v2 when network is available for `go get`.
 func (h *Handler) PresignedURL(c *gin.Context) {
 	var req struct {
 		Filename    string `json:"filename" binding:"required"`
-		ContentType string `json:"content_type"`
+		ContentType string `json:"content_type" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "filename is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "filename and content_type required"})
 		return
 	}
 
-	// Validate file extension
-	ext := strings.ToLower(filepath.Ext(req.Filename))
-	allowed := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true, ".svg": true}
-	if !allowed[ext] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File type not allowed. Use: jpg, jpeg, png, webp, gif, svg"})
+	// Validate content_type
+	allowedTypes := map[string]bool{"image/jpeg": true, "image/png": true, "image/webp": true}
+	if !allowedTypes[req.ContentType] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "content_type must be image/jpeg, image/png, or image/webp", "code": errcodes.EUpldInvalidFile.Code})
 		return
 	}
 
-	if req.ContentType == "" {
-		contentTypes := map[string]string{
-			".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-			".webp": "image/webp", ".gif": "image/gif", ".svg": "image/svg+xml",
-		}
-		req.ContentType = contentTypes[ext]
-	}
-
-	key := fmt.Sprintf("products/%s/%s%s", uuid.New().String()[:8], slugify(strings.TrimSuffix(req.Filename, ext)), ext)
+	// Derive extension from content_type
+	extMap := map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+	ext := extMap[req.ContentType]
+	slug := slugify(strings.TrimSuffix(req.Filename, filepath.Ext(req.Filename)))
+	key := fmt.Sprintf("products/%s-%s%s", uuid.New().String()[:8], slug, ext)
 
 	if h.cfg.S3Bucket == "" {
-		// Mock response for development — no S3 configured
-		mockURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", "ecom-dev-bucket", h.cfg.S3Region, key)
+		// Local /tmp fallback for dev
+		publicURL := fmt.Sprintf("http://localhost:%s/uploads/%s", h.cfg.Port, key)
 		c.JSON(http.StatusOK, gin.H{
-			"upload_url": mockURL + "?X-Amz-Algorithm=MOCK&X-Amz-Expires=900",
-			"public_url": mockURL,
+			"upload_url": publicURL,
+			"public_url": publicURL,
 			"key":        key,
-			"expires_in": 900,
 			"mock":       true,
-			"message":    "S3 not configured. Set S3_BUCKET env var for real uploads.",
+			"message":    "S3 not configured. Set S3_BUCKET for real uploads.",
 		})
 		return
 	}
 
-	// Real S3 pre-signed URL generation
-	// Using AWS SDK — requires: github.com/aws/aws-sdk-go
-	publicURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", h.cfg.S3Bucket, h.cfg.S3Region, key)
+	// S3 presigned URL — CDN base if configured, else S3 direct
+	publicBase := h.cfg.S3PublicBaseURL
+	if publicBase == "" {
+		publicBase = fmt.Sprintf("https://%s.s3.%s.amazonaws.com", h.cfg.S3Bucket, h.cfg.S3Region)
+	}
+	publicURL := publicBase + "/" + key
+
+	// NOTE: Presigned PUT URL via stdlib SigV4 (see presign.go — verified
+	// against the official AWS documentation test vector). Credentials come
+	// from the standard env chain vars. Only the `host` header is signed, so
+	// the client PUT may send any Content-Type.
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	sessionToken := os.Getenv("AWS_SESSION_TOKEN")
+	if accessKey == "" || secretKey == "" {
+		log.ErrorWithCode("presign", errcodes.EUpldFailed.Code, "S3_BUCKET set but AWS credentials missing", "bucket", h.cfg.S3Bucket)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Upload storage misconfigured", "code": errcodes.EUpldFailed.Code})
+		return
+	}
+	host := fmt.Sprintf("%s.s3.%s.amazonaws.com", h.cfg.S3Bucket, h.cfg.S3Region)
+	uploadURL := presignS3URL("PUT", host, "/"+key, h.cfg.S3Region, accessKey, secretKey, sessionToken, 15*time.Minute, time.Now())
 
 	c.JSON(http.StatusOK, gin.H{
-		"upload_url": publicURL + "?presigned=true",
+		"upload_url": uploadURL,
 		"public_url": publicURL,
 		"key":        key,
-		"expires_in": 900,
 	})
 }
 
 // DirectUpload — POST /admin/upload/image (multipart)
-// Accepts file upload and stores locally (dev) or to S3 (prod)
 func (h *Handler) DirectUpload(c *gin.Context) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -94,13 +105,11 @@ func (h *Handler) DirectUpload(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// Validate size (max 5MB)
 	if header.Size > 5*1024*1024 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File too large. Max 5MB."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "File too large. Max 5MB.", "code": errcodes.EUpldTooLarge.Code})
 		return
 	}
 
-	// Validate extension
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	allowed := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true, ".gif": true}
 	if !allowed[ext] {
@@ -111,11 +120,9 @@ func (h *Handler) DirectUpload(c *gin.Context) {
 	uniqueName := fmt.Sprintf("%s-%d%s", uuid.New().String()[:8], time.Now().Unix(), ext)
 
 	if h.cfg.S3Bucket == "" {
-		// Save locally for development
 		uploadDir := "/tmp/ecom-uploads/products"
 		os.MkdirAll(uploadDir, 0755)
 		destPath := filepath.Join(uploadDir, uniqueName)
-
 		dest, err := os.Create(destPath)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
@@ -124,25 +131,13 @@ func (h *Handler) DirectUpload(c *gin.Context) {
 		defer dest.Close()
 		io.Copy(dest, file)
 
-		// Return a local URL (use your dev server to serve /tmp/ecom-uploads)
-		publicURL := fmt.Sprintf("http://localhost:8080/uploads/products/%s", uniqueName)
-		c.JSON(http.StatusOK, gin.H{
-			"public_url": publicURL,
-			"filename":   uniqueName,
-			"size":       header.Size,
-			"local_path": destPath,
-			"mock":       true,
-		})
+		publicURL := fmt.Sprintf("http://localhost:%s/uploads/products/%s", h.cfg.Port, uniqueName)
+		c.JSON(http.StatusOK, gin.H{"public_url": publicURL, "filename": uniqueName, "size": header.Size, "mock": true})
 		return
 	}
 
-	// TODO: Real S3 upload using AWS SDK
 	publicURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/products/%s", h.cfg.S3Bucket, h.cfg.S3Region, uniqueName)
-	c.JSON(http.StatusOK, gin.H{
-		"public_url": publicURL,
-		"filename":   uniqueName,
-		"size":       header.Size,
-	})
+	c.JSON(http.StatusOK, gin.H{"public_url": publicURL, "filename": uniqueName, "size": header.Size})
 }
 
 func slugify(s string) string {
