@@ -1,5 +1,5 @@
 # Binaries
-api
+/api
 *.exe
 *.dll
 *.so
@@ -24,5 +24,7 @@ Thumbs.db
 
 # Env
 .env
+.env.*
+!.env.example
 *.env.local
 *.log

@@ -57,7 +57,7 @@ Admin: products/categories/coupons CRUD, `GET /admin/orders?q=&status=&payment_s
 | REDIS_URL | Yes | Cache + serviceability cache |
 | JWT_SECRET | Yes (prod) | JWT signing key |
 | GOOGLE_CLIENT_ID | Yes (prod) | Google OAuth |
-| GUEST_ORDER_SECRET | Yes (prod) | HMAC key for guest tokens (fail-closed) |
+| GUEST_TOKEN_SECRET | Yes (prod) | HMAC key for guest tokens (fail-closed) |
 | PAYMENT_GATEWAY | No | `razorpay` (default; `stripe` parked) |
 | RAZORPAY_KEY_ID / KEY_SECRET / WEBHOOK_SECRET | For payments | Signature verification fail-closed in prod |
 | SHIPMOZO_PUBLIC_KEY / PRIVATE_KEY | For shipping | Absent → mock provider |
