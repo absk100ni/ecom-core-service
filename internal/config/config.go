@@ -4,6 +4,8 @@ import "os"
 
 type Config struct {
 	Port        string
+	BindHost    string
+	BindHostSet bool
 	MongoURI    string
 	MongoDB     string
 	RedisAddr   string
@@ -30,6 +32,9 @@ type Config struct {
 	CashfreeSecret        string // also used to verify Cashfree webhook signature
 	CashfreeEnv           string // "sandbox" or "production"
 	CashfreeReturnURL     string // storefront URL Cashfree redirects to after checkout
+	// Checkout emergency control
+	CheckoutEnabled    bool
+	CheckoutEnabledSet bool
 	// Partial Payment
 	PartialPaymentEnabled        bool
 	PartialPaymentDefaultPercent int
@@ -85,18 +90,32 @@ type Config struct {
 	PendingOrderTTLMinutes int
 	// Guest Checkout
 	GuestTokenSecret string
+	// Operations
+	OpsMonitorIntervalMinutes int
+	OpsShipmentStaleMinutes   int
+	OpsRefundStaleMinutes     int
+	SentryMaxEventsPerHour    int
 	// Sentry
 	SentryDSN string
 }
 
 func Load() *Config {
+	_, bindHostSet := os.LookupEnv("BIND_HOST")
+	environment := getEnv("ENVIRONMENT", "development")
+	checkoutValue, checkoutEnabledSet := os.LookupEnv("CHECKOUT_ENABLED")
+	checkoutEnabled := checkoutValue == "true"
+	if !checkoutEnabledSet {
+		checkoutEnabled = environment != "production"
+	}
 	return &Config{
 		Port:                         getEnv("PORT", "8080"),
+		BindHost:                     getEnv("BIND_HOST", "127.0.0.1"),
+		BindHostSet:                  bindHostSet,
 		MongoURI:                     getEnv("MONGO_URI", "mongodb://localhost:27017/ecom"),
 		MongoDB:                      getEnv("MONGO_DB", "ecom"),
 		RedisAddr:                    getEnv("REDIS_ADDR", "localhost:6379"),
 		JWTSecret:                    getEnv("JWT_SECRET", "dev-secret-key"),
-		Environment:                  getEnv("ENVIRONMENT", "development"),
+		Environment:                  environment,
 		CORSOrigins:                  getEnv("CORS_ORIGINS", "*"),
 		LogLevel:                     getEnv("LOG_LEVEL", "info"),
 		LogFormat:                    getEnv("LOG_FORMAT", "text"),
@@ -115,6 +134,8 @@ func Load() *Config {
 		CashfreeSecret:               getEnv("CASHFREE_SECRET_KEY", ""),
 		CashfreeEnv:                  getEnv("CASHFREE_ENV", "sandbox"),
 		CashfreeReturnURL:            getEnv("CASHFREE_RETURN_URL", "https://yourstore.com/orders"),
+		CheckoutEnabled:              checkoutEnabled,
+		CheckoutEnabledSet:           checkoutEnabledSet,
 		PartialPaymentEnabled:        getEnv("PARTIAL_PAYMENT_ENABLED", "true") == "true",
 		PartialPaymentDefaultPercent: atoiDefault(getEnv("PARTIAL_PAYMENT_DEFAULT_PERCENT", "20"), 20),
 		AllowFullCOD:                 getEnv("ALLOW_FULL_COD", "false") == "true",
@@ -146,16 +167,20 @@ func Load() *Config {
 		StoreName:                    getEnv("STORE_NAME", "ElectroMart"),
 		StoreURL:                     getEnv("STORE_URL", "https://electromart.in"),
 		ContactNotifyEmail:           getEnv("CONTACT_NOTIFY_EMAIL", ""),
-		BusinessLegalName:            getEnv("BUSINESS_LEGAL_NAME", "ElectroMart Private Limited"),
+		BusinessLegalName:            getEnv("BUSINESS_LEGAL_NAME", ""),
 		BusinessAddress:              getEnv("BUSINESS_ADDRESS", ""),
 		BusinessGSTIN:                getEnv("BUSINESS_GSTIN", ""),
-		BusinessState:                getEnv("BUSINESS_STATE", "Delhi"),
-		BusinessStateCode:            getEnv("BUSINESS_STATE_CODE", "07"),
-		DefaultGSTPercent:            atoiDefault(getEnv("DEFAULT_GST_PERCENT", "18"), 18),
-		DefaultHSNCode:               getEnv("DEFAULT_HSN_CODE", "8471"),
+		BusinessState:                getEnv("BUSINESS_STATE", ""),
+		BusinessStateCode:            getEnv("BUSINESS_STATE_CODE", ""),
+		DefaultGSTPercent:            atoiDefault(getEnv("DEFAULT_GST_PERCENT", "0"), 0),
+		DefaultHSNCode:               getEnv("DEFAULT_HSN_CODE", ""),
 		ReturnWindowDays:             atoiDefault(getEnv("RETURN_WINDOW_DAYS", "7"), 7),
 		PendingOrderTTLMinutes:       atoiDefault(getEnv("PENDING_ORDER_TTL_MINUTES", "30"), 30),
 		GuestTokenSecret:             getEnvWithFallback("GUEST_TOKEN_SECRET", "JWT_SECRET", "dev-guest-secret"),
+		OpsMonitorIntervalMinutes:    atoiDefault(getEnv("OPS_MONITOR_INTERVAL_MINUTES", "5"), 5),
+		OpsShipmentStaleMinutes:      atoiDefault(getEnv("OPS_SHIPMENT_STALE_MINUTES", "120"), 120),
+		OpsRefundStaleMinutes:        atoiDefault(getEnv("OPS_REFUND_STALE_MINUTES", "60"), 60),
+		SentryMaxEventsPerHour:       atoiDefault(getEnv("SENTRY_MAX_EVENTS_PER_HOUR", "20"), 20),
 		SentryDSN:                    getEnv("SENTRY_DSN", ""),
 	}
 }

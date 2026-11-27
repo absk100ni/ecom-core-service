@@ -3,6 +3,7 @@ package user
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"time"
 
 	"ecom-core-service/internal/models"
@@ -17,6 +18,13 @@ import (
 
 var log = logger.New("USER", "PROFILE")
 var _ = errcodes.EUsrNotFound
+var addressPhone = regexp.MustCompile(`^\d{10}$`)
+var addressPincode = regexp.MustCompile(`^[1-9]\d{5}$`)
+
+func validateAddress(addr models.Address) bool {
+	return addr.Name != "" && addr.Line1 != "" && addr.City != "" && addr.State != "" &&
+		addressPhone.MatchString(addr.Phone) && addressPincode.MatchString(addr.Pincode)
+}
 
 type Handler struct{ db *mongo.Database }
 
@@ -93,6 +101,11 @@ func (h *Handler) AddAddress(c *gin.Context) {
 		return
 	}
 
+	if !validateAddress(addr) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Complete address, 10-digit phone, and valid 6-digit pincode are required"})
+		return
+	}
+
 	addr.ID = uuid.New().String()
 	if addr.Country == "" {
 		addr.Country = "India"
@@ -106,7 +119,14 @@ func (h *Handler) AddAddress(c *gin.Context) {
 
 	// If is_default or first address, clear other defaults
 	var user models.User
-	h.db.Collection("users").FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
+	if err := h.db.Collection("users").FindOne(ctx, bson.M{"_id": userID}).Decode(&user); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+	if len(user.Addresses) >= 20 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "A maximum of 20 saved addresses is allowed"})
+		return
+	}
 	if len(user.Addresses) == 0 {
 		addr.IsDefault = true
 	}
@@ -129,6 +149,14 @@ func (h *Handler) UpdateAddress(c *gin.Context) {
 	var updates map[string]interface{}
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid data"})
+		return
+	}
+	if phone, ok := updates["phone"].(string); ok && !addressPhone.MatchString(phone) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Phone must be exactly 10 digits"})
+		return
+	}
+	if pincode, ok := updates["pincode"].(string); ok && !addressPincode.MatchString(pincode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Pincode must be a valid 6-digit Indian pincode"})
 		return
 	}
 

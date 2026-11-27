@@ -3,6 +3,7 @@ package order
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -29,6 +30,8 @@ var log = logger.New("ORDER", "MGMT")
 
 // nonDigits strips everything but digits from a search query ("ORD 98264" → "98264").
 var nonDigits = regexp.MustCompile(`\D`)
+var checkoutPhone = regexp.MustCompile(`^\d{10}$`)
+var checkoutPincode = regexp.MustCompile(`^[1-9]\d{5}$`)
 
 // Shipping thresholds in paise — single source of truth server-side.
 // Must match storefront src/config/constants.ts (₹999 free-shipping, ₹49 charge).
@@ -37,11 +40,23 @@ const (
 	shippingCharge        = 4900
 )
 
+var (
+	ErrDeliveryUnavailable = errors.New("delivery is not available for this pincode")
+	ErrDeliveryCheckFailed = errors.New("delivery availability could not be confirmed")
+	ErrPriceChanged        = errors.New("a product price changed")
+	ErrCouponInvalid       = errors.New("coupon is no longer available")
+)
+
+type serviceabilityChecker interface {
+	IsServiceable(ctx context.Context, pincode string, codAmountPaise int) (bool, error)
+}
+
 type Handler struct {
 	db       *mongo.Database
 	cfg      *config.Config
 	useTxn   bool // true when the Mongo deployment supports multi-document transactions (replica set)
 	notifier *notify.Notifier
+	shipping serviceabilityChecker
 }
 
 func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
@@ -50,6 +65,12 @@ func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
 
 // WithNotifier injects the notification service (optional — nil means no notifications).
 func (h *Handler) WithNotifier(n *notify.Notifier) *Handler { h.notifier = n; return h }
+
+// WithServiceabilityChecker makes the courier provider authoritative at checkout.
+func (h *Handler) WithServiceabilityChecker(checker serviceabilityChecker) *Handler {
+	h.shipping = checker
+	return h
+}
 
 // supportsTransactions probes whether the connected deployment is a replica set / sharded
 // cluster (a prerequisite for multi-document transactions). Standalone mongod — common in
@@ -102,6 +123,11 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 
+	if !checkoutPhone.MatchString(req.ShippingAddress.Phone) || !checkoutPincode.MatchString(req.ShippingAddress.Pincode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Phone must be 10 digits and pincode must be a valid 6-digit Indian pincode", "code": errcodes.EOrdAddressInvalid.Code})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -130,8 +156,19 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		log.ErrorWithCode("CREATE", errcodes.EOrdCreateFailed.Code, "Order creation failed", "user_id", userID, "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order", "code": errcodes.EOrdCreateFailed.Code})
+		switch {
+		case errors.Is(err, ErrDeliveryUnavailable):
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error(), "code": errcodes.EOrdAddressInvalid.Code})
+		case errors.Is(err, ErrDeliveryCheckFailed):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Delivery availability could not be confirmed. Please try again.", "code": errcodes.EOrdCreateFailed.Code})
+		case errors.Is(err, ErrPriceChanged):
+			c.JSON(http.StatusConflict, gin.H{"error": "A product price changed. Refresh your cart and review the new total before paying.", "code": errcodes.EOrdCreateFailed.Code})
+		case errors.Is(err, ErrCouponInvalid):
+			c.JSON(http.StatusConflict, gin.H{"error": "The coupon is no longer available. Review the total and try again.", "code": errcodes.EOrdCreateFailed.Code})
+		default:
+			log.ErrorWithCode("CREATE", errcodes.EOrdCreateFailed.Code, "Order creation failed", "user_id", userID, "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order", "code": errcodes.EOrdCreateFailed.Code})
+		}
 		return
 	}
 
@@ -176,16 +213,44 @@ func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []mod
 	maxAdvancePercent := 0
 
 	for _, ci := range cartItems {
+		filter := bson.M{"_id": ci.ProductID, "is_active": true, "stock": bson.M{"$gte": ci.Quantity}}
+		increments := bson.M{"stock": -ci.Quantity}
+		if ci.VariantID != "" {
+			filter["variants"] = bson.M{"$elemMatch": bson.M{"id": ci.VariantID, "stock": bson.M{"$gte": ci.Quantity}}}
+			increments["variants.$.stock"] = -ci.Quantity
+		} else {
+			filter["$or"] = []bson.M{{"variants": bson.M{"$exists": false}}, {"variants": bson.M{"$size": 0}}}
+		}
+
 		var product models.Product
 		decErr := h.db.Collection("products").FindOneAndUpdate(ctx,
-			bson.M{"_id": ci.ProductID, "is_active": true, "stock": bson.M{"$gte": ci.Quantity}},
-			bson.M{"$inc": bson.M{"stock": -ci.Quantity}},
+			filter,
+			bson.M{"$inc": increments},
 			options.FindOneAndUpdate().SetReturnDocument(options.Before),
 		).Decode(&product)
 
 		if decErr != nil {
-			log.WarnWithCode("CREATE", errcodes.EOrdStockFailed.Code, "Stock check failed for item", "user_id", userID, "product", ci.Name, "product_id", ci.ProductID, "requested_qty", ci.Quantity)
-			return nil, items, []string{fmt.Sprintf("%s: insufficient stock or not found", ci.Name)}, nil
+			log.WarnWithCode("CREATE", errcodes.EOrdStockFailed.Code, "Stock or variant check failed for item", "user_id", userID, "product", ci.Name, "product_id", ci.ProductID, "variant_id", ci.VariantID, "requested_qty", ci.Quantity)
+			return nil, items, []string{fmt.Sprintf("%s: insufficient stock, invalid variant, or unavailable product", ci.Name)}, nil
+		}
+
+		unitPrice := product.Price
+		variantLabel := ""
+		if ci.VariantID != "" {
+			variantFound := false
+			for _, variant := range product.Variants {
+				if variant.ID == ci.VariantID {
+					variantFound = true
+					variantLabel = variant.Name + ": " + variant.Value
+					if variant.Price > 0 {
+						unitPrice = variant.Price
+					}
+					break
+				}
+			}
+			if !variantFound {
+				return nil, items, []string{fmt.Sprintf("%s: selected variant is unavailable", product.Name)}, nil
+			}
 		}
 
 		// Track max advance_percent across items
@@ -194,23 +259,37 @@ func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []mod
 		}
 
 		items = append(items, models.OrderItem{
-			ProductID: ci.ProductID, VariantID: ci.VariantID,
-			Name: ci.Name, SKU: product.SKU, Price: ci.Price,
-			Quantity: ci.Quantity, Image: ci.Image,
+			ProductID: product.ID, VariantID: ci.VariantID, VariantLabel: variantLabel,
+			Name: product.Name, SKU: product.SKU, Price: unitPrice,
+			Quantity: ci.Quantity, Image: product.Thumbnail, Weight: product.Weight,
+			LengthCM: product.LengthCM, WidthCM: product.WidthCM, HeightCM: product.HeightCM,
 		})
-		subtotal += ci.Price * ci.Quantity
+		if ci.Price > 0 && ci.Price != unitPrice {
+			return nil, items, nil, fmt.Errorf("%w: %s", ErrPriceChanged, product.Name)
+		}
+		subtotal += unitPrice * ci.Quantity
 	}
 
 	discount := 0
 	couponUsed := false
+	couponCode = strings.ToUpper(strings.TrimSpace(couponCode))
 	if couponCode != "" {
 		var coupon models.Coupon
-		cErr := h.db.Collection("coupons").FindOne(ctx, bson.M{"code": couponCode, "is_active": true}).Decode(&coupon)
-		if cErr == nil && subtotal >= coupon.MinOrder && coupon.UsedCount < coupon.UsageLimit && time.Now().Before(coupon.ExpiresAt) {
+		couponErr := h.db.Collection("coupons").FindOneAndUpdate(ctx,
+			bson.M{
+				"code": couponCode, "is_active": true,
+				"min_order":  bson.M{"$lte": subtotal},
+				"expires_at": bson.M{"$gt": time.Now()},
+				"$expr":      bson.M{"$lt": []interface{}{"$used_count", "$usage_limit"}},
+			},
+			bson.M{"$inc": bson.M{"used_count": 1}},
+			options.FindOneAndUpdate().SetReturnDocument(options.Before),
+		).Decode(&coupon)
+		if couponErr == nil {
 			if coupon.Type == "percentage" {
 				discount = subtotal * coupon.Value / 100
 				if rem := discount % 100; rem != 0 {
-					discount += 100 - rem // whole rupees, rounded in customer's favor
+					discount += 100 - rem
 				}
 				if coupon.MaxDiscount > 0 && discount > coupon.MaxDiscount {
 					discount = coupon.MaxDiscount
@@ -221,13 +300,12 @@ func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []mod
 					discount = subtotal
 				}
 			}
-			if _, uErr := h.db.Collection("coupons").UpdateOne(ctx, bson.M{"_id": coupon.ID}, bson.M{"$inc": bson.M{"used_count": 1}}); uErr != nil {
-				return nil, items, nil, fmt.Errorf("coupon update failed: %w", uErr)
-			}
 			couponUsed = true
 			log.Info("CREATE", "Coupon applied", "user_id", userID, "coupon", couponCode, "discount", discount)
+		} else if couponErr != mongo.ErrNoDocuments {
+			return nil, items, nil, fmt.Errorf("coupon update failed: %w", couponErr)
 		} else {
-			log.Debug("CREATE", "Coupon not applicable", "user_id", userID, "coupon", couponCode)
+			return nil, items, nil, ErrCouponInvalid
 		}
 	}
 
@@ -304,6 +382,15 @@ func (h *Handler) placeOrderTxn(ctx context.Context, userID string, cartItems []
 			stockDetails = details
 			return nil, errStockAbort
 		}
+		if h.shipping != nil {
+			serviceable, serviceErr := h.shipping.IsServiceable(sessCtx, o.ShippingAddress.Pincode, o.CODAmount)
+			if serviceErr != nil {
+				return nil, fmt.Errorf("%w: %v", ErrDeliveryCheckFailed, serviceErr)
+			}
+			if !serviceable {
+				return nil, ErrDeliveryUnavailable
+			}
+		}
 		if _, iErr := h.db.Collection("orders").InsertOne(sessCtx, o); iErr != nil {
 			return nil, fmt.Errorf("order insert: %w", iErr)
 		}
@@ -337,22 +424,63 @@ func (h *Handler) placeOrderManual(ctx context.Context, userID string, cartItems
 		return nil, stockDetails, nil
 	}
 
+	if h.shipping != nil {
+		serviceable, serviceErr := h.shipping.IsServiceable(ctx, order.ShippingAddress.Pincode, order.CODAmount)
+		if serviceErr != nil || !serviceable {
+			h.restoreStock(ctx, decremented)
+			if order.CouponUsed {
+				h.db.Collection("coupons").UpdateOne(ctx,
+					bson.M{"code": order.CouponCode, "used_count": bson.M{"$gt": 0}},
+					bson.M{"$inc": bson.M{"used_count": -1}},
+				)
+			}
+			if serviceErr != nil {
+				return nil, nil, fmt.Errorf("%w: %v", ErrDeliveryCheckFailed, serviceErr)
+			}
+			return nil, nil, ErrDeliveryUnavailable
+		}
+	}
+
 	if _, iErr := h.db.Collection("orders").InsertOne(ctx, order); iErr != nil {
-		log.ErrorWithCode("CREATE", errcodes.EOrdCreateFailed.Code, "Order insert failed, rolling back stock", "user_id", userID, "err", iErr)
+		log.ErrorWithCode("CREATE", errcodes.EOrdCreateFailed.Code, "Order insert failed, rolling back stock and coupon", "user_id", userID, "err", iErr)
 		h.restoreStock(ctx, decremented)
+		if order.CouponUsed {
+			h.db.Collection("coupons").UpdateOne(ctx,
+				bson.M{"code": order.CouponCode, "used_count": bson.M{"$gt": 0}},
+				bson.M{"$inc": bson.M{"used_count": -1}},
+			)
+		}
 		return nil, nil, iErr
 	}
 
-	h.db.Collection("carts").UpdateOne(ctx, bson.M{"user_id": userID},
-		bson.M{"$set": bson.M{"items": []models.CartItem{}, "updated_at": time.Now()}})
-
+	// Keep the cart until payment succeeds. This matches the transaction path and
+	// preserves a customer's cart when the payment window is dismissed.
 	return order, nil, nil
 }
 
 // restoreStock adds back the quantities for a set of order items (compensating rollback).
+func stockIncrement(item models.OrderItem, quantity int) bson.M {
+	increments := bson.M{"stock": quantity}
+	if item.VariantID != "" {
+		increments["variants.$[variant].stock"] = quantity
+	}
+	return increments
+}
+
+func stockArrayFilters(item models.OrderItem) *options.UpdateOptions {
+	if item.VariantID == "" {
+		return options.Update()
+	}
+	return options.Update().SetArrayFilters(options.ArrayFilters{Filters: []interface{}{bson.M{"variant.id": item.VariantID}}})
+}
+
 func (h *Handler) restoreStock(ctx context.Context, items []models.OrderItem) {
 	for _, item := range items {
-		h.db.Collection("products").UpdateOne(ctx, bson.M{"_id": item.ProductID}, bson.M{"$inc": bson.M{"stock": item.Quantity}})
+		h.db.Collection("products").UpdateOne(ctx,
+			bson.M{"_id": item.ProductID},
+			bson.M{"$inc": stockIncrement(item, item.Quantity)},
+			stockArrayFilters(item),
+		)
 	}
 }
 
@@ -462,20 +590,36 @@ func (h *Handler) Cancel(c *gin.Context) {
 	}
 
 	now := time.Now()
+	refundableOnline := order.Total
+	if order.PaymentPlan == "partial" && order.AdvanceAmount > 0 {
+		refundableOnline = order.AdvanceAmount
+	}
 	update := bson.M{"status": "cancelled", "cancel_reason": req.Reason, "cancelled_at": now, "updated_at": now}
 	if order.PaymentStatus == "paid" {
-		update["refund_amount"] = order.Total
+		update["refund_requested_amount"] = refundableOnline
 		update["payment_status"] = "refund_pending"
 	}
-	h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": orderID}, bson.M{"$set": update})
+	cancelResult, cancelErr := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": orderID, "user_id": userID, "status": order.Status, "payment_status": order.PaymentStatus},
+		bson.M{"$set": update},
+	)
+	if cancelErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Order cancellation failed", "code": errcodes.EOrdCancelFailed.Code})
+		return
+	}
+	if cancelResult.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Order changed while cancellation was being processed. Refresh and try again.", "code": errcodes.EOrdCancelFailed.Code})
+		return
+	}
 
 	// Idempotent stock and coupon release
 	ReleaseStock(ctx, h.db, &order)
 	ReleaseCoupon(ctx, h.db, &order)
 
-	// P1-2: Auto-refund for paid orders via Razorpay
+	// Auto-refund only what the gateway collected. COD that was never collected
+	// is not part of a pre-shipment cancellation refund.
 	if order.PaymentStatus == "paid" && order.PaymentID != "" {
-		h.attemptAutoRefund(ctx, &order, order.Total)
+		h.attemptAutoRefund(ctx, &order, refundableOnline)
 	}
 
 	log.Info("CANCEL", "Order cancelled", "order_id", orderID, "order_number", order.OrderNumber, "user_id", userID, "reason", req.Reason, "refund_pending", order.PaymentStatus == "paid")
@@ -483,7 +627,7 @@ func (h *Handler) Cancel(c *gin.Context) {
 	// Send cancellation SMS via MSG91
 	go utils.SendOrderCancelledSMS(order.ShippingAddress.Phone, order.OrderNumber)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Order cancelled", "refund_amount": order.Total})
+	c.JSON(http.StatusOK, gin.H{"message": "Order cancelled", "refund_amount": refundableOnline})
 }
 
 // ==================== ADMIN ENDPOINTS ====================
@@ -498,6 +642,20 @@ func (h *Handler) AdminList(c *gin.Context) {
 	}
 	if ps := c.Query("payment_status"); ps != "" {
 		filter["payment_status"] = ps
+	}
+	createdRange := bson.M{}
+	if from := c.Query("from"); from != "" {
+		if parsed, err := time.Parse("2006-01-02", from); err == nil {
+			createdRange["$gte"] = parsed
+		}
+	}
+	if to := c.Query("to"); to != "" {
+		if parsed, err := time.Parse("2006-01-02", to); err == nil {
+			createdRange["$lt"] = parsed.AddDate(0, 0, 1)
+		}
+	}
+	if len(createdRange) > 0 {
+		filter["created_at"] = createdRange
 	}
 	// Server-side search: order number (customer-facing id), internal id,
 	// customer name or phone. Searches ALL orders, not just the loaded page.
@@ -598,18 +756,29 @@ func (h *Handler) UpdateStatus(c *gin.Context) {
 	}
 
 	// For cancellation via admin, set cancel fields and handle refund
+	refundableOnline := order.Total
+	if order.PaymentPlan == "partial" && order.AdvanceAmount > 0 {
+		refundableOnline = order.AdvanceAmount
+	}
 	if req.Status == "cancelled" {
 		setFields["cancelled_at"] = now
 		if order.PaymentStatus == "paid" {
 			setFields["payment_status"] = "refund_pending"
-			setFields["refund_amount"] = order.Total
+			setFields["refund_requested_amount"] = refundableOnline
 		}
 	}
 
-	result, err := h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": setFields})
-	if err != nil || result.MatchedCount == 0 {
-		log.Warn("UPDATE_STATUS", "Order update failed", "order_id", id)
-		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
+	result, err := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": id, "status": order.Status, "payment_status": order.PaymentStatus},
+		bson.M{"$set": setFields},
+	)
+	if err != nil {
+		log.Error("UPDATE_STATUS", "Order update failed", "order_id", id, "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Order status update failed"})
+		return
+	}
+	if result.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Order changed while the status update was being processed. Refresh and try again."})
 		return
 	}
 
@@ -624,7 +793,7 @@ func (h *Handler) UpdateStatus(c *gin.Context) {
 
 		// P1-2: Auto-refund for paid cancelled orders
 		if req.Status == "cancelled" && order.PaymentStatus == "refund_pending" && order.PaymentID != "" {
-			h.attemptAutoRefund(ctx, &order, order.Total)
+			h.attemptAutoRefund(ctx, &order, refundableOnline)
 		}
 	}
 
@@ -691,34 +860,92 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 	if req.Amount > 0 {
 		if req.Amount > remainingRefundable {
 			c.JSON(http.StatusBadRequest, gin.H{
-				"error":               fmt.Sprintf("Refund amount %d exceeds remaining refundable %d", req.Amount, remainingRefundable),
-				"code":                errcodes.EOrdRefundAmount.Code,
-				"max_refundable":      maxRefundable,
-				"already_refunded":    order.RefundAmount,
+				"error":                fmt.Sprintf("Refund amount %d exceeds remaining refundable %d", req.Amount, remainingRefundable),
+				"code":                 errcodes.EOrdRefundAmount.Code,
+				"max_refundable":       maxRefundable,
+				"already_refunded":     order.RefundAmount,
 				"remaining_refundable": remainingRefundable,
 			})
 			return
 		}
 		refundAmount = req.Amount
 	}
-	now := time.Now()
-	refundID := "REFUND-" + uuid.New().String()[:8]
-
-	// Attempt gateway-level refund for Stripe payments (pi_ prefix on payment_id)
-	if h.cfg.StripeSecretKey != "" && order.PaymentID != "" && len(order.PaymentID) > 3 && order.PaymentID[:3] == "pi_" {
-		stripeRefundID, err := h.processStripeRefund(order.PaymentID, refundAmount)
-		if err != nil {
-			log.Error("REFUND", "Stripe refund API failed", "order_id", id, "err", err.Error())
-			c.JSON(http.StatusBadGateway, gin.H{"error": "Stripe refund failed: " + err.Error(), "code": errcodes.EOrdRefundFailed.Code})
-			return
-		}
-		refundID = stripeRefundID
+	if order.PaymentID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No gateway payment is recorded for this order", "code": errcodes.EOrdRefundFailed.Code})
+		return
 	}
 
-	h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{
-		"payment_status": "refunded", "refund_id": refundID,
-		"refund_amount": refundAmount, "refunded_at": now, "updated_at": now,
-	}})
+	claim, claimErr := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": id, "refund_processing": bson.M{"$ne": true}, "refund_reconciliation_required": bson.M{"$ne": true}},
+		bson.M{"$set": bson.M{"refund_processing": true, "refund_processing_started_at": time.Now()}},
+	)
+	if claimErr != nil || claim.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "A refund is already in progress or requires reconciliation", "code": errcodes.EOrdRefundFailed.Code})
+		return
+	}
+	providerConfirmed := false
+	defer func() {
+		if !providerConfirmed {
+			h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": id, "refund_processing": true}, bson.M{"$unset": bson.M{"refund_processing": "", "refund_processing_started_at": ""}})
+		}
+	}()
+
+	var refundID string
+	var refundErr error
+	switch {
+	case strings.HasPrefix(order.PaymentID, "pay_"):
+		if h.cfg.RazorpayKeyID == "" || h.cfg.RazorpaySecret == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Razorpay refund credentials are not configured", "code": errcodes.EOrdRefundFailed.Code})
+			return
+		}
+		refundID, refundErr = h.processRazorpayRefund(order.PaymentID, refundAmount)
+	case strings.HasPrefix(order.PaymentID, "pi_"):
+		if h.cfg.StripeSecretKey == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Stripe refund credentials are not configured", "code": errcodes.EOrdRefundFailed.Code})
+			return
+		}
+		refundID, refundErr = h.processStripeRefund(order.PaymentID, refundAmount)
+	default:
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "Refunds are not supported for this payment provider", "code": errcodes.EOrdRefundFailed.Code})
+		return
+	}
+	if refundErr != nil {
+		log.Error("REFUND", "Gateway refund failed", "order_id", id, "err", refundErr.Error())
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Payment provider did not confirm the refund", "code": errcodes.EOrdRefundFailed.Code})
+		return
+	}
+
+	providerConfirmed = true
+	now := time.Now()
+	newRefundTotal := order.RefundAmount + refundAmount
+	paymentStatus := "paid"
+	if newRefundTotal >= maxRefundable {
+		paymentStatus = "refunded"
+	}
+	refundFilter := bson.M{"_id": id, "refund_amount": order.RefundAmount, "refund_processing": true}
+	if order.RefundAmount == 0 {
+		refundFilter = bson.M{"_id": id, "refund_processing": true, "$or": []bson.M{{"refund_amount": 0}, {"refund_amount": bson.M{"$exists": false}}}}
+	}
+	result, updateErr := h.db.Collection("orders").UpdateOne(ctx,
+		refundFilter,
+		bson.M{
+			"$set": bson.M{
+				"payment_status": paymentStatus, "refund_id": refundID,
+				"refund_amount": newRefundTotal, "refund_requested_amount": 0, "refunded_at": now, "updated_at": now,
+			},
+			"$push":  bson.M{"refunds": bson.M{"refund_id": refundID, "amount": refundAmount, "processed_at": now}},
+			"$unset": bson.M{"refund_processing": "", "refund_processing_started_at": ""},
+		},
+	)
+	if updateErr != nil || result.MatchedCount == 0 {
+		// The provider already accepted the refund. Keep the claim locked and mark
+		// it for reconciliation so another click cannot refund the same amount.
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": id}, bson.M{"$set": bson.M{"refund_reconciliation_required": true, "refund_reconciliation_id": refundID, "updated_at": time.Now()}})
+		log.Error("REFUND", "Gateway refund succeeded but order reconciliation failed", "order_id", id, "refund_id", refundID, "err", updateErr)
+		c.Set("audit_provider_reference", refundID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Refund succeeded at the provider but order reconciliation requires attention", "refund_id": refundID, "code": errcodes.EOrdRefundFailed.Code})
+		return
+	}
 
 	log.Info("REFUND", "Refund processed", "refund_id", refundID, "order_id", id, "order_number", order.OrderNumber, "amount", refundAmount)
 
@@ -732,6 +959,8 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		}
 	}
 
+	c.Set("audit_provider_reference", refundID)
+	c.Set("audit_reason", req.Notes)
 	c.JSON(http.StatusOK, gin.H{"message": "Refund processed", "refund_id": refundID, "refund_amount": refundAmount, "order_number": order.OrderNumber})
 }
 
@@ -748,11 +977,15 @@ func (h *Handler) attemptAutoRefund(ctx context.Context, order *models.Order, am
 	var refundID string
 	var refundErr error
 
-	// Try Razorpay refund
-	if h.cfg.RazorpayKeyID != "" && order.PaymentID != "" {
+	// Select the provider from the payment id that was actually captured. Do not
+	// infer it from whichever credentials happen to be configured today.
+	switch {
+	case strings.HasPrefix(order.PaymentID, "pay_") && h.cfg.RazorpayKeyID != "" && h.cfg.RazorpaySecret != "":
 		refundID, refundErr = h.processRazorpayRefund(order.PaymentID, amount)
-	} else if h.cfg.StripeSecretKey != "" && order.PaymentID != "" && len(order.PaymentID) > 3 && order.PaymentID[:3] == "pi_" {
+	case strings.HasPrefix(order.PaymentID, "pi_") && h.cfg.StripeSecretKey != "":
 		refundID, refundErr = h.processStripeRefund(order.PaymentID, amount)
+	default:
+		refundErr = fmt.Errorf("refund provider unavailable for payment %s", order.PaymentID)
 	}
 
 	now := time.Now()
@@ -762,13 +995,25 @@ func (h *Handler) attemptAutoRefund(ctx context.Context, order *models.Order, am
 	}
 
 	if refundID != "" {
-		h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": order.ID}, bson.M{"$set": bson.M{
-			"payment_status": "refunded",
-			"refund_id":      refundID,
-			"refund_amount":  amount,
-			"refunded_at":    now,
-			"updated_at":     now,
-		}})
+		result, updateErr := h.db.Collection("orders").UpdateOne(ctx,
+			bson.M{"_id": order.ID, "payment_status": "refund_pending", "refund_id": bson.M{"$in": []interface{}{"", nil}}},
+			bson.M{
+				"$set": bson.M{
+					"payment_status":          "refunded",
+					"refund_id":               refundID,
+					"refund_amount":           amount,
+					"refund_requested_amount": 0,
+					"refunded_at":             now,
+					"updated_at":              now,
+				},
+				"$push": bson.M{"refunds": bson.M{"refund_id": refundID, "amount": amount, "processed_at": now}},
+			},
+		)
+		if updateErr != nil || result.MatchedCount == 0 {
+			h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"refund_reconciliation_required": true, "refund_reconciliation_id": refundID, "updated_at": time.Now()}})
+			log.Error("AUTO_REFUND", "Provider refund succeeded but order reconciliation failed", "order_id", order.ID, "refund_id", refundID, "err", updateErr)
+			return
+		}
 		log.Info("AUTO_REFUND", "Refund processed", "order_id", order.ID, "refund_id", refundID, "amount", amount)
 	}
 }

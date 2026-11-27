@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"testing"
+
+	"ecom-core-service/internal/config"
 )
 
 func TestHmacSHA256(t *testing.T) {
@@ -104,5 +106,19 @@ func TestCashfreeSignatureVerification(t *testing.T) {
 	tamperedSig := hmacSHA256Base64(timestamp+`{"type":"ORDER_PAID","data":{"order":{"order_id":"EVIL"}}}`, secret)
 	if tamperedSig == validSig {
 		t.Error("Tampered payload produced same signature")
+	}
+}
+
+func TestActiveGatewayFailsClosedInProduction(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{Environment: "production", PaymentGateway: "razorpay"}}
+	if got := handler.activeGateway(); got != "unconfigured" {
+		t.Fatalf("activeGateway() = %q, want unconfigured", got)
+	}
+}
+
+func TestActiveGatewayAllowsMockOnlyInDevelopment(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{Environment: "development", PaymentGateway: "razorpay"}}
+	if got := handler.activeGateway(); got != "mock" {
+		t.Fatalf("activeGateway() = %q, want mock", got)
 	}
 }

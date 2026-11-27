@@ -29,19 +29,45 @@ func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
 	return &Handler{db: db, cfg: cfg}
 }
 
+type returnItemRequest struct {
+	ProductID string `json:"product_id" binding:"required"`
+	Qty       int    `json:"qty" binding:"required,gt=0"`
+	Reason    string `json:"reason" binding:"required"`
+}
+
+func validateReturnItems(orderItems []models.OrderItem, requested []returnItemRequest) ([]models.ReturnItem, error) {
+	purchasedQty := make(map[string]int, len(orderItems))
+	for _, item := range orderItems {
+		purchasedQty[item.ProductID] += item.Quantity
+	}
+	seen := make(map[string]bool, len(requested))
+	items := make([]models.ReturnItem, 0, len(requested))
+	for _, item := range requested {
+		maxQty, exists := purchasedQty[item.ProductID]
+		if !exists {
+			return nil, fmt.Errorf("return item is not part of this order")
+		}
+		if seen[item.ProductID] {
+			return nil, fmt.Errorf("duplicate product in return request")
+		}
+		if item.Qty > maxQty {
+			return nil, fmt.Errorf("return quantity for product %s exceeds purchased quantity of %d", item.ProductID, maxQty)
+		}
+		seen[item.ProductID] = true
+		items = append(items, models.ReturnItem{ProductID: item.ProductID, Qty: item.Qty, Reason: item.Reason})
+	}
+	return items, nil
+}
+
 // Create handles POST /api/v1/orders/:id/return
 func (h *Handler) Create(c *gin.Context) {
 	userID := c.GetString("user_id")
 	orderID := c.Param("id")
 
 	var req struct {
-		Items []struct {
-			ProductID string `json:"product_id" binding:"required"`
-			Qty       int    `json:"qty" binding:"required,gt=0"`
-			Reason    string `json:"reason" binding:"required"`
-		} `json:"items" binding:"required,min=1"`
-		Type    string `json:"type" binding:"required,oneof=return replacement"`
-		Comment string `json:"comment"`
+		Items   []returnItemRequest `json:"items" binding:"required,min=1"`
+		Type    string              `json:"type" binding:"required,oneof=return replacement"`
+		Comment string              `json:"comment"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": errcodes.ERtnInvalidData.Code})
@@ -93,14 +119,12 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 
-	// Build items
-	items := make([]models.ReturnItem, 0, len(req.Items))
-	for _, ri := range req.Items {
-		items = append(items, models.ReturnItem{
-			ProductID: ri.ProductID,
-			Qty:       ri.Qty,
-			Reason:    ri.Reason,
-		})
+	// Validate every requested line against the immutable order snapshot. Never
+	// trust product ids or quantities supplied by the browser.
+	items, validationErr := validateReturnItems(order.Items, req.Items)
+	if validationErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error(), "code": errcodes.ERtnInvalidData.Code})
+		return
 	}
 
 	now := time.Now()
@@ -168,6 +192,17 @@ func (h *Handler) AdminList(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"return_requests": results, "total": len(results)})
 }
 
+func validReturnTransition(current, next string) bool {
+	switch current {
+	case "requested":
+		return next == "approved" || next == "rejected"
+	case "approved":
+		return next == "completed"
+	default:
+		return false
+	}
+}
+
 // AdminUpdate handles PUT /api/v1/admin/returns/:id
 func (h *Handler) AdminUpdate(c *gin.Context) {
 	id := c.Param("id")
@@ -184,46 +219,35 @@ func (h *Handler) AdminUpdate(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	var current models.ReturnRequest
+	if err := h.db.Collection("return_requests").FindOne(ctx, bson.M{"_id": id}).Decode(&current); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Return request not found", "code": errcodes.ERtnNotFound.Code})
+		return
+	}
+	if !validReturnTransition(current.Status, req.Status) {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Cannot transition return from '%s' to '%s'", current.Status, req.Status), "code": errcodes.ERtnInvalidData.Code})
+		return
+	}
+
 	update := bson.M{"$set": bson.M{"status": req.Status, "updated_at": time.Now()}}
 	if req.AdminNote != "" {
 		update["$set"].(bson.M)["admin_note"] = req.AdminNote
 	}
 
-	result, err := h.db.Collection("return_requests").UpdateOne(ctx, bson.M{"_id": id}, update)
-	if err != nil || result.MatchedCount == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Return request not found", "code": errcodes.ERtnNotFound.Code})
+	result, err := h.db.Collection("return_requests").UpdateOne(ctx, bson.M{"_id": id, "status": current.Status}, update)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Return request update failed", "code": errcodes.ERtnCreateFailed.Code})
+		return
+	}
+	if result.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Return request changed while the update was being processed", "code": errcodes.ERtnInvalidData.Code})
 		return
 	}
 
-	// P1-2b: Auto-refund when return is approved for a paid order
-	if req.Status == "approved" || req.Status == "completed" {
-		var rr models.ReturnRequest
-		h.db.Collection("return_requests").FindOne(ctx, bson.M{"_id": id}).Decode(&rr)
+	// Approval records the operational decision only. Refunds are processed from
+	// the order screen through the payment provider, and replacements must never
+	// enter a refund path implicitly.
 
-		var returnOrder models.Order
-		if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": rr.OrderID}).Decode(&returnOrder); err == nil {
-			if returnOrder.PaymentStatus == "paid" || returnOrder.PaymentStatus == "refund_pending" {
-				// Calculate return amount from returned items
-				returnAmount := 0
-				for _, ri := range rr.Items {
-					for _, oi := range returnOrder.Items {
-						if oi.ProductID == ri.ProductID {
-							returnAmount += oi.Price * ri.Qty
-						}
-					}
-				}
-				if returnAmount > 0 {
-					now := time.Now()
-					h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": rr.OrderID}, bson.M{"$set": bson.M{
-						"payment_status": "refund_pending",
-						"refund_amount":  returnAmount,
-						"updated_at":     now,
-					}})
-					log.Info("RETURN_REFUND", "Return approved — refund pending", "order_id", rr.OrderID, "return_amount", returnAmount)
-				}
-			}
-		}
-	}
-
+	c.Set("audit_reason", req.AdminNote)
 	c.JSON(http.StatusOK, gin.H{"message": "Return request updated", "status": req.Status})
 }

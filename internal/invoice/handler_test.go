@@ -3,6 +3,9 @@ package invoice
 import (
 	"testing"
 	"time"
+
+	"ecom-core-service/internal/config"
+	"ecom-core-service/internal/models"
 )
 
 func TestGSTInclusiveTaxable(t *testing.T) {
@@ -104,5 +107,33 @@ func TestCGSTSGSTSplit(t *testing.T) {
 	sgst2 := gst2 - cgst2 // 76
 	if cgst2 != 75 || sgst2 != 76 {
 		t.Errorf("Odd split: CGST=%d SGST=%d, want 75/76", cgst2, sgst2)
+	}
+}
+
+func TestInvoiceLinesRequireProductTaxData(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{}}
+	order := &models.Order{Items: []models.OrderItem{{ProductID: "product-1", Name: "Work Light", Price: 11800, Quantity: 1}}}
+
+	if _, err := handler.computeInvoiceLines(order, map[string]*models.Product{}); err == nil {
+		t.Fatal("expected missing product tax data to block invoice generation")
+	}
+	if _, err := handler.computeInvoiceLines(order, map[string]*models.Product{
+		"product-1": {ID: "product-1", GSTPercent: 0, HSNCode: ""},
+	}); err == nil {
+		t.Fatal("expected empty GST and HSN values to block invoice generation")
+	}
+}
+
+func TestInvoiceLinesUseExplicitProductTaxData(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{}}
+	order := &models.Order{Items: []models.OrderItem{{ProductID: "product-1", Name: "Work Light", Price: 11800, Quantity: 1}}}
+	lines, err := handler.computeInvoiceLines(order, map[string]*models.Product{
+		"product-1": {ID: "product-1", GSTPercent: 18, HSNCode: "9405"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(lines) != 1 || lines[0].GSTRate != 18 || lines[0].HSN != "9405" || lines[0].GSTAmount != 1800 {
+		t.Fatalf("unexpected invoice line: %+v", lines)
 	}
 }

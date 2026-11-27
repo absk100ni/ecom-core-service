@@ -70,6 +70,13 @@ func (h *Handler) PresignedURL(c *gin.Context) {
 	// S3 presigned URL — CDN base if configured, else S3 direct
 	publicBase := h.cfg.S3PublicBaseURL
 	if publicBase == "" {
+		if h.cfg.Environment == "production" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "Private image delivery is not configured; set S3_PUBLIC_BASE_URL to the approved CDN origin",
+				"code":  errcodes.EUpldFailed.Code,
+			})
+			return
+		}
 		publicBase = fmt.Sprintf("https://%s.s3.%s.amazonaws.com", h.cfg.S3Bucket, h.cfg.S3Region)
 	}
 	publicURL := publicBase + "/" + key
@@ -136,8 +143,13 @@ func (h *Handler) DirectUpload(c *gin.Context) {
 		return
 	}
 
-	publicURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/products/%s", h.cfg.S3Bucket, h.cfg.S3Region, uniqueName)
-	c.JSON(http.StatusOK, gin.H{"public_url": publicURL, "filename": uniqueName, "size": header.Size})
+	// Production uploads must use the presigned PUT flow. This endpoint cannot
+	// truthfully accept a file when S3 is configured because it does not have an
+	// S3 upload client; returning a made-up URL would lose the image silently.
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error": "Direct upload is unavailable for S3 storage; request a presigned upload URL",
+		"code":  errcodes.EUpldFailed.Code,
+	})
 }
 
 func slugify(s string) string {

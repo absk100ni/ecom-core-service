@@ -25,6 +25,7 @@ import (
 
 var log = logger.New("PRODUCT", "CATALOG")
 var _ = errcodes.EProdNotFound
+var hsnCodePattern = regexp.MustCompile(`^\d{4,8}$`)
 
 // Cache TTLs — short enough that admin edits show up quickly, long enough to absorb the
 // storefront read storm. Writes also bust the relevant cache (see invalidate*).
@@ -203,7 +204,10 @@ func (h *Handler) Get(c *gin.Context) {
 
 	id := c.Param("id")
 	var product models.Product
-	err := h.db.Collection("products").FindOne(ctx, bson.M{"$or": []bson.M{{"_id": id}, {"slug": id}}}).Decode(&product)
+	err := h.db.Collection("products").FindOne(ctx, bson.M{
+		"$or":       []bson.M{{"_id": id}, {"slug": id}},
+		"is_active": true,
+	}).Decode(&product)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Product not found"})
 		return
@@ -276,6 +280,22 @@ func (h *Handler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Stock cannot be negative"})
 		return
 	}
+	if product.Weight <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Product weight must be greater than 0 grams"})
+		return
+	}
+	if product.LengthCM <= 0 || product.WidthCM <= 0 || product.HeightCM <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Product package length, width, and height must be greater than 0 cm"})
+		return
+	}
+	if product.GSTPercent <= 0 || product.GSTPercent > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "GST percentage must be between 1 and 100"})
+		return
+	}
+	if !hsnCodePattern.MatchString(product.HSNCode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "HSN code must contain 4 to 8 digits"})
+		return
+	}
 	if product.Category == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Category is required"})
 		return
@@ -309,11 +329,22 @@ func (h *Handler) Create(c *gin.Context) {
 		product.Tags = []string{}
 	}
 
-	// Generate variant IDs if missing
+	// Generate variant IDs if missing and reject incomplete option records.
+	seenVariantIDs := map[string]bool{}
 	for i := range product.Variants {
-		if product.Variants[i].ID == "" {
-			product.Variants[i].ID = uuid.New().String()
+		variant := &product.Variants[i]
+		if variant.Name == "" || variant.Value == "" || variant.Stock < 0 || variant.Price < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Each variant requires name, value, non-negative stock, and non-negative price"})
+			return
 		}
+		if variant.ID == "" {
+			variant.ID = uuid.New().String()
+		}
+		if seenVariantIDs[variant.ID] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Variant IDs must be unique within a product"})
+			return
+		}
+		seenVariantIDs[variant.ID] = true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -330,6 +361,7 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 	h.invalidateProductCache(ctx)
+	c.Set("audit_resource_id", product.ID)
 	c.JSON(http.StatusCreated, product)
 }
 
@@ -358,6 +390,48 @@ func (h *Handler) Update(c *gin.Context) {
 			return
 		}
 	}
+	if weight, ok := updates["weight"]; ok {
+		if value, ok := weight.(float64); ok && value <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Product weight must be greater than 0 grams"})
+			return
+		}
+	}
+	for _, field := range []string{"length_cm", "width_cm", "height_cm"} {
+		if raw, ok := updates[field]; ok {
+			if value, ok := raw.(float64); ok && value <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Product package dimensions must be greater than 0 cm"})
+				return
+			}
+		}
+	}
+	if raw, ok := updates["gst_percent"]; ok {
+		if value, ok := raw.(float64); ok && (value <= 0 || value > 100) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "GST percentage must be between 1 and 100"})
+			return
+		}
+	}
+	if raw, ok := updates["hsn_code"]; ok {
+		if value, ok := raw.(string); !ok || !hsnCodePattern.MatchString(value) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "HSN code must contain 4 to 8 digits"})
+			return
+		}
+	}
+	if raw, ok := updates["variants"]; ok {
+		encoded, marshalErr := json.Marshal(raw)
+		var variants []models.Variant
+		if marshalErr != nil || json.Unmarshal(encoded, &variants) != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid product variants"})
+			return
+		}
+		seen := map[string]bool{}
+		for _, variant := range variants {
+			if variant.ID == "" || variant.Name == "" || variant.Value == "" || variant.Stock < 0 || variant.Price < 0 || seen[variant.ID] {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Each updated variant requires a unique id, name, value, and non-negative stock and price"})
+				return
+			}
+			seen[variant.ID] = true
+		}
+	}
 	if ca, ok := updates["compare_at_price"]; ok {
 		if v, ok := ca.(float64); ok && v < 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Compare-at price (MRP) cannot be negative"})
@@ -367,6 +441,24 @@ func (h *Handler) Update(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	var current models.Product
+	if err := h.db.Collection("products").FindOne(ctx, bson.M{"_id": id}).Decode(&current); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Product not found"})
+		return
+	}
+	newPrice := current.Price
+	newCompareAt := current.CompareAt
+	if value, ok := updates["price"].(float64); ok {
+		newPrice = int(value)
+	}
+	if value, ok := updates["compare_at_price"].(float64); ok {
+		newCompareAt = int(value)
+	}
+	if newCompareAt > 0 && newCompareAt < newPrice {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Compare-at price must be greater than or equal to selling price"})
+		return
+	}
 
 	result, err := h.db.Collection("products").UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": updates})
 	if err != nil || result.MatchedCount == 0 {
@@ -448,6 +540,7 @@ func (h *Handler) CreateCategory(c *gin.Context) {
 
 	h.db.Collection("categories").InsertOne(ctx, cat)
 	h.invalidateCategoryCache(ctx)
+	c.Set("audit_resource_id", cat.ID)
 	c.JSON(http.StatusCreated, cat)
 }
 
@@ -870,7 +963,7 @@ func (h *Handler) BulkUploadCSV(c *gin.Context) {
 		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
 	}
 
-	required := []string{"name", "price", "category"}
+	required := []string{"name", "price", "category", "weight", "length_cm", "width_cm", "height_cm", "gst_percent", "hsn_code"}
 	for _, r := range required {
 		if _, ok := headerMap[r]; !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required column: " + r})
@@ -921,8 +1014,23 @@ func (h *Handler) BulkUploadCSV(c *gin.Context) {
 		}
 
 		weight := 0
-		if w := getVal("weight"); w != "" {
-			fmt.Sscanf(w, "%d", &weight)
+		fmt.Sscanf(getVal("weight"), "%d", &weight)
+		lengthCM, widthCM, heightCM := 0, 0, 0
+		fmt.Sscanf(getVal("length_cm"), "%d", &lengthCM)
+		fmt.Sscanf(getVal("width_cm"), "%d", &widthCM)
+		fmt.Sscanf(getVal("height_cm"), "%d", &heightCM)
+		if weight <= 0 || lengthCM <= 0 || widthCM <= 0 || heightCM <= 0 {
+			failed++
+			errors = append(errors, name+": weight and package dimensions must be greater than 0")
+			continue
+		}
+		gstPercent := 0
+		fmt.Sscanf(getVal("gst_percent"), "%d", &gstPercent)
+		hsnCode := getVal("hsn_code")
+		if gstPercent <= 0 || gstPercent > 100 || !hsnCodePattern.MatchString(hsnCode) {
+			failed++
+			errors = append(errors, name+": valid GST percentage and 4-8 digit HSN code are required")
+			continue
 		}
 
 		compareAt := 0
@@ -956,7 +1064,8 @@ func (h *Handler) BulkUploadCSV(c *gin.Context) {
 			ID: uuid.New().String(), Name: name, Slug: slugify(name),
 			Description: getVal("description"), Category: getVal("category"),
 			Price: price, CompareAt: compareAt, SKU: sku,
-			Stock: stock, Weight: weight, Images: images, Tags: tags,
+			Stock: stock, Weight: weight, LengthCM: lengthCM, WidthCM: widthCM, HeightCM: heightCM,
+			GSTPercent: gstPercent, HSNCode: hsnCode, Images: images, Tags: tags,
 			Thumbnail: getVal("thumbnail"), IsActive: true,
 			Variants:  []models.Variant{},
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
@@ -998,15 +1107,72 @@ func (h *Handler) ExportCSV(c *gin.Context) {
 	c.Header("Content-Disposition", "attachment; filename=products.csv")
 
 	writer := csv.NewWriter(c.Writer)
-	writer.Write([]string{"name", "slug", "description", "category", "price", "compare_at_price", "sku", "stock", "weight", "tags", "thumbnail", "images"})
+	writer.Write([]string{"name", "slug", "description", "category", "price", "compare_at_price", "sku", "stock", "weight", "length_cm", "width_cm", "height_cm", "gst_percent", "hsn_code", "tags", "thumbnail", "images"})
 
 	for _, p := range products {
 		writer.Write([]string{
 			p.Name, p.Slug, p.Description, p.Category,
 			fmt.Sprintf("%d", p.Price), fmt.Sprintf("%d", p.CompareAt),
 			p.SKU, fmt.Sprintf("%d", p.Stock), fmt.Sprintf("%d", p.Weight),
+			fmt.Sprintf("%d", p.LengthCM), fmt.Sprintf("%d", p.WidthCM), fmt.Sprintf("%d", p.HeightCM),
+			fmt.Sprintf("%d", p.GSTPercent), p.HSNCode,
 			strings.Join(p.Tags, "|"), p.Thumbnail, strings.Join(p.Images, "|"),
 		})
 	}
 	writer.Flush()
+}
+
+// AdminList returns the complete catalog, including inactive products. It is
+// intentionally separate from the public listing so operations never manages a
+// truncated or storefront-filtered view of inventory.
+func (h *Handler) AdminList(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	filter := bson.M{}
+	if search := strings.TrimSpace(c.Query("search")); search != "" {
+		filter["name"] = bson.M{"$regex": regexp.QuoteMeta(search), "$options": "i"}
+	}
+
+	page, limit := 1, 100
+	if raw := c.Query("page"); raw != "" {
+		fmt.Sscanf(raw, "%d", &page)
+	}
+	if raw := c.Query("limit"); raw != "" {
+		fmt.Sscanf(raw, "%d", &limit)
+	}
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+
+	total, err := h.db.Collection("products").CountDocuments(ctx, filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count products"})
+		return
+	}
+	opts := options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}}).
+		SetSkip(int64((page - 1) * limit)).SetLimit(int64(limit))
+	cursor, err := h.db.Collection("products").Find(ctx, filter, opts)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch products"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	products := make([]models.Product, 0)
+	if err := cursor.All(ctx, &products); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode products"})
+		return
+	}
+	totalPages := int(total) / limit
+	if int(total)%limit != 0 {
+		totalPages++
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"products": products, "total": total, "page": page,
+		"limit": limit, "total_pages": totalPages,
+	})
 }

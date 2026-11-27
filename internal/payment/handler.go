@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"ecom-core-service/internal/config"
@@ -57,14 +58,17 @@ func (h *Handler) activeGateway() string {
 		return "razorpay"
 	}
 
-	// Configured gateway is missing credentials. In production this is a
-	// misconfiguration we must surface rather than silently swap gateways.
+	// Never fall back to a mock gateway in production. A checkout that reports
+	// success without collecting payment creates an unpaid order that looks paid
+	// to the customer.
 	if h.cfg.Environment == "production" {
 		log.ErrorWithCode("GATEWAY", errcodes.EPayCreateFailed.Code,
 			"Configured payment gateway has no credentials in production", "configured_gateway", gw)
+		return "unconfigured"
 	}
 
-	// Dev/auto-detect: prefer whichever has credentials, else mock for local testing.
+	// Development only: prefer whichever sandbox credential set is available,
+	// otherwise use the explicit mock flow.
 	if h.cfg.StripeSecretKey != "" {
 		return "stripe"
 	}
@@ -263,6 +267,43 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 
 	gateway := h.activeGateway()
+	if gateway == "unconfigured" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Payment gateway is not configured",
+			"code":  errcodes.EPayCreateFailed.Code,
+		})
+		return
+	}
+
+	// Reuse the active payment attempt for this order. Retrying checkout must not
+	// create several independently payable gateway orders for one store order.
+	var existing models.Payment
+	if err := h.db.Collection("payments").FindOne(ctx, bson.M{
+		"order_id": order.ID, "user_id": userID, "status": "created",
+		"$or": []bson.M{{"method": gateway}, {"method": bson.M{"$exists": false}}},
+	}).Decode(&existing); err == nil {
+		response := gin.H{
+			"payment_id": existing.ID, "gateway": gateway, "amount": existing.Amount,
+			"currency": existing.Currency, "order_id": order.ID, "order_number": order.OrderNumber,
+		}
+		switch gateway {
+		case "razorpay":
+			response["razorpay_order_id"] = existing.RazorpayOrderID
+			response["razorpay_key_id"] = h.cfg.RazorpayKeyID
+		case "cashfree":
+			response["cf_order_id"] = existing.RazorpayOrderID
+			response["payment_session_id"] = existing.PaymentSessionID
+			response["cashfree_app_id"] = h.cfg.CashfreeAppID
+			response["cashfree_env"] = h.cfg.CashfreeEnv
+		case "stripe":
+			response["client_secret"] = existing.ClientSecret
+			response["publishable_key"] = h.cfg.StripePublishableKey
+		}
+		log.Info("CREATE", "Reusing active payment", "payment_id", existing.ID, "order_id", order.ID, "gateway", gateway)
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
 	log.Info("CREATE", "Creating payment", "gateway", gateway, "order_id", req.OrderID, "charge_amount", chargeAmount, "total", order.Total)
 
 	var gatewayOrderID, paymentSessionID, gatewayKeyID, stripeClientSecret, stripePaymentIntentID string
@@ -283,9 +324,14 @@ func (h *Handler) Create(c *gin.Context) {
 		payment := models.Payment{
 			ID: paymentID, OrderID: order.ID, UserID: userID,
 			RazorpayOrderID: stripePaymentIntentID, Amount: chargeAmount, Currency: "INR",
+			Method: "stripe", ClientSecret: stripeClientSecret,
 			Status: "created", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}
-		h.db.Collection("payments").InsertOne(ctx, payment)
+		if _, err := h.db.Collection("payments").InsertOne(ctx, payment); err != nil {
+			log.Error("CREATE", "Failed to persist Stripe payment attempt", "order_id", order.ID, "err", err)
+			c.JSON(http.StatusConflict, gin.H{"error": "A payment attempt already exists. Please retry.", "code": errcodes.EPayCreateFailed.Code})
+			return
+		}
 
 		log.Info("CREATE", "Stripe payment created", "payment_id", paymentID, "pi_id", stripePaymentIntentID)
 		c.JSON(http.StatusOK, gin.H{
@@ -321,7 +367,14 @@ func (h *Handler) Create(c *gin.Context) {
 		paymentSessionID = sessionID
 		gatewayKeyID = h.cfg.CashfreeAppID
 
-	default: // mock
+	case "unconfigured":
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Payment gateway is not configured",
+			"code":  errcodes.EPayCreateFailed.Code,
+		})
+		return
+
+	default: // mock — development only
 		gatewayOrderID = "order_mock_" + uuid.New().String()[:16]
 		gatewayKeyID = ""
 	}
@@ -329,9 +382,14 @@ func (h *Handler) Create(c *gin.Context) {
 	payment := models.Payment{
 		ID: uuid.New().String(), OrderID: order.ID, UserID: userID,
 		RazorpayOrderID: gatewayOrderID, Amount: chargeAmount, Currency: "INR",
+		Method: gateway, PaymentSessionID: paymentSessionID,
 		Status: "created", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
-	h.db.Collection("payments").InsertOne(ctx, payment)
+	if _, err := h.db.Collection("payments").InsertOne(ctx, payment); err != nil {
+		log.Error("CREATE", "Failed to persist payment attempt", "order_id", order.ID, "gateway", gateway, "err", err)
+		c.JSON(http.StatusConflict, gin.H{"error": "A payment attempt already exists. Please retry.", "code": errcodes.EPayCreateFailed.Code})
+		return
+	}
 
 	response := gin.H{
 		"payment_id":   payment.ID,
@@ -537,6 +595,63 @@ func (h *Handler) rejectIfOrderInvalid(c *gin.Context, ctx context.Context, orde
 	return false
 }
 
+// refundUnfulfillablePayment claims a captured payment exactly once and either
+// refunds it through the provider or records a manual-refund obligation. It is
+// used when an expired/cancelled order cannot legally be resurrected.
+func (h *Handler) refundUnfulfillablePayment(ctx context.Context, order *models.Order, paymentID, gatewayPaymentID, reason string) {
+	var payment models.Payment
+	if err := h.db.Collection("payments").FindOne(ctx, bson.M{"_id": paymentID}).Decode(&payment); err != nil {
+		log.Error("LATE_REFUND", "Payment record missing", "order_id", order.ID, "payment_id", paymentID)
+		return
+	}
+
+	claim, err := h.db.Collection("payments").UpdateOne(ctx,
+		bson.M{"_id": paymentID, "status": "created"},
+		bson.M{"$set": bson.M{"status": "refund_processing", "razorpay_payment_id": gatewayPaymentID, "updated_at": time.Now()}},
+	)
+	if err != nil || claim.MatchedCount == 0 {
+		return
+	}
+
+	refundStatus := "refund_pending"
+	refundID := ""
+	refundErr := fmt.Errorf("automatic refund is unavailable for this payment provider")
+	if strings.HasPrefix(gatewayPaymentID, "pay_") && h.cfg.RazorpayKeyID != "" && h.cfg.RazorpaySecret != "" {
+		refundID, refundErr = h.razorpayRefund(gatewayPaymentID, payment.Amount)
+	}
+	if refundErr == nil && refundID != "" {
+		refundStatus = "refunded"
+	}
+
+	now := time.Now()
+	orderSet := bson.M{
+		"payment_status":          refundStatus,
+		"payment_id":              gatewayPaymentID,
+		"refund_requested_amount": payment.Amount,
+		"cancel_reason":           reason,
+		"updated_at":              now,
+	}
+	orderUpdate := bson.M{"$set": orderSet}
+	if refundStatus == "refunded" {
+		orderSet["refund_id"] = refundID
+		orderSet["refund_amount"] = payment.Amount
+		orderSet["refund_requested_amount"] = 0
+		orderSet["refunded_at"] = now
+		orderUpdate["$push"] = bson.M{"refunds": bson.M{"refund_id": refundID, "amount": payment.Amount, "processed_at": now}}
+	}
+	if _, err := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": order.ID, "status": order.Status}, orderUpdate); err != nil {
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"refund_reconciliation_required": true, "refund_reconciliation_id": refundID, "updated_at": time.Now()}})
+		log.Error("LATE_REFUND", "Payment refund state could not be reconciled to order", "order_id", order.ID, "refund_id", refundID, "err", err)
+	}
+	h.db.Collection("payments").UpdateOne(ctx, bson.M{"_id": paymentID}, bson.M{"$set": bson.M{
+		"razorpay_payment_id": gatewayPaymentID, "status": refundStatus, "updated_at": now,
+	}})
+	if refundErr != nil {
+		log.Error("LATE_REFUND", "Captured payment requires manual refund", "order_id", order.ID, "payment_id", gatewayPaymentID, "err", refundErr)
+	}
+}
+
 // markPaymentPaid transitions a payment+order to paid. It is idempotent: the order is
 // only updated while its payment_status is still "pending", so webhook retries and
 // duplicate verify/webhook deliveries are safe and never regress an already-advanced
@@ -549,40 +664,46 @@ func (h *Handler) rejectIfOrderInvalid(c *gin.Context, ctx context.Context, orde
 func (h *Handler) markPaymentPaid(ctx context.Context, paymentID, orderID, gatewayPaymentID string) (firstTransition bool) {
 	now := time.Now()
 
-	// Resurrection path: late payment for an abandoned order.
 	var pre models.Order
-	if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": orderID}).Decode(&pre); err == nil && pre.Status == "abandoned" {
+	if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": orderID}).Decode(&pre); err != nil {
+		log.Error("MARK_PAID", "Order not found for captured payment", "order_id", orderID, "payment_id", gatewayPaymentID)
+		return false
+	}
+
+	// Cancelled orders stay cancelled. A late capture is refunded and never
+	// resurrects stock or fulfillment.
+	if pre.Status == "cancelled" {
+		h.refundUnfulfillablePayment(ctx, &pre, paymentID, gatewayPaymentID, "Late payment received for a cancelled order; refund initiated")
+		return false
+	}
+
+	// Abandoned and expired orders released stock. Reclaim it atomically before
+	// accepting a late capture; otherwise refund the captured payment.
+	if pre.Status == "abandoned" || pre.Status == "expired" {
 		if !orderPkg.ReclaimStock(ctx, h.db, &pre) {
-			// Stock got sold to someone else while the order was abandoned — refund.
-			log.Warn("MARK_PAID", "Late payment for abandoned order but stock gone — refunding", "order_id", orderID)
-			refundStatus := "refund_pending"
-			var payRec models.Payment
-			h.db.Collection("payments").FindOne(ctx, bson.M{"_id": paymentID}).Decode(&payRec)
-			if payRec.Amount > 0 {
-				if _, rErr := h.razorpayRefund(gatewayPaymentID, payRec.Amount); rErr == nil {
-					refundStatus = "refunded"
-				} else {
-					log.Error("MARK_PAID", "Auto-refund of late payment failed — needs manual refund", "order_id", orderID, "payment_id", gatewayPaymentID, "err", rErr)
-				}
-			}
-			h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": orderID, "status": "abandoned"},
-				bson.M{"$set": bson.M{"status": "cancelled", "payment_status": refundStatus,
-					"cancel_reason": "Late payment received but stock no longer available — amount refunded", "updated_at": now}})
-			h.db.Collection("payments").UpdateOne(ctx, bson.M{"_id": paymentID},
-				bson.M{"$set": bson.M{"razorpay_payment_id": gatewayPaymentID, "status": refundStatus, "updated_at": now}})
+			log.Warn("MARK_PAID", "Late payment cannot be fulfilled because stock is unavailable", "order_id", orderID, "previous_status", pre.Status)
+			h.refundUnfulfillablePayment(ctx, &pre, paymentID, gatewayPaymentID, "Late payment received but stock is no longer available; refund initiated")
 			return false
 		}
 		orderPkg.ReclaimCoupon(ctx, h.db, &pre)
-		// Flip abandoned → placed so the standard transition below takes over.
-		h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": orderID, "status": "abandoned"},
-			bson.M{"$set": bson.M{"status": "placed", "updated_at": now}})
-		log.Info("MARK_PAID", "Abandoned order resurrected by late payment", "order_id", orderID)
+		// Flip the exact terminal state we read back to placed. If another handler
+		// changed it, do not continue into confirmation.
+		transition, transitionErr := h.db.Collection("orders").UpdateOne(ctx,
+			bson.M{"_id": orderID, "status": pre.Status, "payment_status": "pending"},
+			bson.M{"$set": bson.M{"status": "placed", "updated_at": now}},
+		)
+		if transitionErr != nil || transition.MatchedCount == 0 {
+			orderPkg.ReleaseStock(ctx, h.db, &pre)
+			h.refundUnfulfillablePayment(ctx, &pre, paymentID, gatewayPaymentID, "Late payment could not be reconciled to the order; refund initiated")
+			return false
+		}
+		log.Info("MARK_PAID", "Terminal order resurrected by late payment", "order_id", orderID, "previous_status", pre.Status)
 	}
 
 	// Only flip the order if it hasn't already been paid. MatchedCount==0 means a
 	// concurrent/duplicate delivery already handled it.
 	res, err := h.db.Collection("orders").UpdateOne(ctx,
-		bson.M{"_id": orderID, "payment_status": "pending"},
+		bson.M{"_id": orderID, "status": "placed", "payment_status": "pending"},
 		bson.M{"$set": bson.M{
 			"payment_id": gatewayPaymentID, "payment_status": "paid", "status": "confirmed", "updated_at": now,
 		}})
@@ -591,15 +712,15 @@ func (h *Handler) markPaymentPaid(ctx context.Context, paymentID, orderID, gatew
 		return false
 	}
 
-	// Always keep the payment record in sync (safe to repeat).
+	if res.MatchedCount == 0 {
+		log.Info("MARK_PAID", "Order was not eligible for payment transition", "order_id", orderID, "status", pre.Status, "payment_status", pre.PaymentStatus)
+		return false
+	}
+
+	// Keep the payment record in sync after the order transition succeeds.
 	h.db.Collection("payments").UpdateOne(ctx, bson.M{"_id": paymentID}, bson.M{"$set": bson.M{
 		"razorpay_payment_id": gatewayPaymentID, "status": "paid", "updated_at": now,
 	}})
-
-	if res.MatchedCount == 0 {
-		log.Info("MARK_PAID", "Order already paid — skipping duplicate transition", "order_id", orderID)
-		return false
-	}
 
 	// First transition to paid: clear the customer's cart (kept intact until now so a
 	// dismissed payment returns them to an unchanged checkout) and fire the

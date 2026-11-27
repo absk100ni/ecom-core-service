@@ -3,6 +3,8 @@ package returns
 import (
 	"testing"
 	"time"
+
+	"ecom-core-service/internal/models"
 )
 
 func TestReturnWindowEnforcement(t *testing.T) {
@@ -49,6 +51,56 @@ func TestNonDeliveredRejection(t *testing.T) {
 	for _, s := range invalidStatuses {
 		if s == "delivered" {
 			t.Errorf("Status %q should not be in invalid list", s)
+		}
+	}
+}
+
+func TestValidateReturnItems(t *testing.T) {
+	orderItems := []models.OrderItem{
+		{ProductID: "product-a", Quantity: 2},
+		{ProductID: "product-b", Quantity: 1},
+	}
+
+	tests := []struct {
+		name      string
+		requested []returnItemRequest
+		wantErr   bool
+	}{
+		{"valid subset", []returnItemRequest{{ProductID: "product-a", Qty: 1, Reason: "damaged"}}, false},
+		{"quantity exceeds purchase", []returnItemRequest{{ProductID: "product-a", Qty: 3, Reason: "damaged"}}, true},
+		{"unknown product", []returnItemRequest{{ProductID: "product-c", Qty: 1, Reason: "wrong item"}}, true},
+		{"duplicate product", []returnItemRequest{{ProductID: "product-a", Qty: 1, Reason: "damaged"}, {ProductID: "product-a", Qty: 1, Reason: "damaged"}}, true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			items, err := validateReturnItems(orderItems, test.requested)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateReturnItems() error = %v, wantErr %v", err, test.wantErr)
+			}
+			if !test.wantErr && len(items) != len(test.requested) {
+				t.Fatalf("validated %d items, want %d", len(items), len(test.requested))
+			}
+		})
+	}
+}
+
+func TestValidReturnTransition(t *testing.T) {
+	tests := []struct {
+		current string
+		next    string
+		valid   bool
+	}{
+		{"requested", "approved", true},
+		{"requested", "rejected", true},
+		{"approved", "completed", true},
+		{"requested", "completed", false},
+		{"rejected", "approved", false},
+		{"completed", "approved", false},
+	}
+	for _, test := range tests {
+		if got := validReturnTransition(test.current, test.next); got != test.valid {
+			t.Errorf("validReturnTransition(%q, %q) = %v, want %v", test.current, test.next, got, test.valid)
 		}
 	}
 }

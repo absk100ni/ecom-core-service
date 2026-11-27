@@ -195,8 +195,9 @@ var (
 
 // ==================== MIDDLEWARE ERRORS (EMID) ====================
 var (
-	EMidRateLimit  = ErrorInfo{"EMID001", "Too many requests", "Rate limit exceeded", http.StatusTooManyRequests}
-	EMidAuthFailed = ErrorInfo{"EMID002", "Authentication failed", "Token validation error in middleware", http.StatusUnauthorized}
+	EMidRateLimit     = ErrorInfo{"EMID001", "Too many requests", "Rate limit exceeded", http.StatusTooManyRequests}
+	EMidAuthFailed    = ErrorInfo{"EMID002", "Authentication failed", "Token validation error in middleware", http.StatusUnauthorized}
+	ECheckoutDisabled = ErrorInfo{"ECHK001", "Checkout is temporarily unavailable", "Checkout emergency control is disabled", http.StatusServiceUnavailable}
 )
 
 // ==================== INVOICE ERRORS (EINV) ====================
@@ -262,7 +263,7 @@ func init() {
 		EUsrNotFound, EUsrUpdateFailed, EUsrAddrNotFound, EUsrAddrAddFailed,
 		EUsrAddrDelFailed, EUsrAddrLimit,
 		EUpldFailed, EUpldInvalidFile, EUpldS3Failed, EUpldTooLarge,
-		EMidRateLimit, EMidAuthFailed,
+		EMidRateLimit, EMidAuthFailed, ECheckoutDisabled,
 		EDBConnectFailed, EDBQueryFailed, EDBIndexFailed,
 		EGoogUnconfigured, EGoogInvalidToken, EGoogEmailUnverified, EGoogLinkConflict,
 		EAdmInvalidCreds, EAdmTokenRequired, EAdmRateLimited,

@@ -27,9 +27,10 @@ type Client struct {
 	authHeader string // X-Sentry-Auth value
 	env        string // production, development, etc.
 
-	mu       sync.Mutex
-	count    int       // events in current window
-	windowAt time.Time // start of current rate-limit window
+	mu               sync.Mutex
+	count            int       // events in current window
+	windowAt         time.Time // start of current rate-limit window
+	maxEventsPerHour int
 
 	dedupeMap map[string]time.Time // hash -> last sent time
 }
@@ -68,19 +69,29 @@ func ParseDSN(dsn string) (*parsedDSN, error) {
 }
 
 const (
-	maxEventsPerHour = 5
-	dedupeWindow     = 1 * time.Hour
-	maxDedupeEntries = 100
-	sendTimeout      = 5 * time.Second
+	defaultMaxEventsPerHour = 5
+	maxEventsPerHour        = defaultMaxEventsPerHour // backward-compatible test/default alias
+	dedupeWindow            = 1 * time.Hour
+	maxDedupeEntries        = 100
+	sendTimeout             = 5 * time.Second
 )
 
 // New creates a Sentry client. Returns a disabled no-op client if dsn is empty
 // or environment is not "production".
 func New(dsn, environment string) *Client {
+	return NewWithLimit(dsn, environment, defaultMaxEventsPerHour)
+}
+
+// NewWithLimit creates a client with a bounded, configurable hourly event cap.
+func NewWithLimit(dsn, environment string, maxEventsPerHour int) *Client {
+	if maxEventsPerHour < 1 {
+		maxEventsPerHour = defaultMaxEventsPerHour
+	}
 	c := &Client{
-		env:       environment,
-		dedupeMap: make(map[string]time.Time),
-		windowAt:  time.Now(),
+		env:              environment,
+		dedupeMap:        make(map[string]time.Time),
+		windowAt:         time.Now(),
+		maxEventsPerHour: maxEventsPerHour,
 	}
 
 	if dsn == "" || environment != "production" {
@@ -115,7 +126,7 @@ func (c *Client) CaptureError(message string, tags map[string]string) {
 		return
 	}
 
-	sig := dedupeKey(message, tags["path"])
+	sig := dedupeKey(message, tags)
 
 	c.mu.Lock()
 	// Rate cap: fixed window per hour
@@ -124,7 +135,11 @@ func (c *Client) CaptureError(message string, tags map[string]string) {
 		c.count = 0
 		c.windowAt = now
 	}
-	if c.count >= maxEventsPerHour {
+	limit := c.maxEventsPerHour
+	if limit < 1 {
+		limit = defaultMaxEventsPerHour
+	}
+	if c.count >= limit {
 		c.mu.Unlock()
 		log.Warn("RATE", "Sentry event dropped (rate cap)", "message", truncate(message, 80))
 		return
@@ -223,8 +238,11 @@ func generateEventID() string {
 	return hex.EncodeToString(b)
 }
 
-func dedupeKey(message, path string) string {
-	return message + "|" + path
+func dedupeKey(message string, tags map[string]string) string {
+	if code := tags["event_code"]; code != "" {
+		return code + "|" + tags["resource_type"] + "|" + tags["resource_id"]
+	}
+	return message + "|" + tags["path"]
 }
 
 func (c *Client) evictDedupe() {

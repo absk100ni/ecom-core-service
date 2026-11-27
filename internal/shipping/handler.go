@@ -88,6 +88,94 @@ func (h *Handler) CreateShipment(c *gin.Context) {
 		codAmount = order.CODAmount
 	}
 
+	if h.cfg.Environment == "production" && (h.cfg.ShipmozoPublicKey == "" || h.cfg.ShipmozoPrivateKey == "") {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Shipping provider is not configured", "code": errcodes.EShipCreateFailed.Code})
+		return
+	}
+
+	// Build billable weight from the products in the order snapshot. A guessed
+	// 500 g parcel can undercharge shipping and produce carrier adjustments.
+	productIDs := make([]string, 0, len(order.Items))
+	for _, item := range order.Items {
+		productIDs = append(productIDs, item.ProductID)
+	}
+	productsByID := make(map[string]models.Product, len(productIDs))
+	cursor, productErr := h.db.Collection("products").Find(ctx, bson.M{"_id": bson.M{"$in": productIDs}})
+	if productErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not load product shipping data", "code": errcodes.EShipCreateFailed.Code})
+		return
+	}
+	var products []models.Product
+	if err := cursor.All(ctx, &products); err != nil {
+		cursor.Close(ctx)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read product shipping data", "code": errcodes.EShipCreateFailed.Code})
+		return
+	}
+	cursor.Close(ctx)
+	for _, product := range products {
+		productsByID[product.ID] = product
+	}
+
+	weightGrams, lengthCM, widthCM, heightCM := 0, 0, 0, 0
+	for _, item := range order.Items {
+		product := productsByID[item.ProductID]
+		weight := item.Weight
+		if weight <= 0 {
+			weight = product.Weight
+		}
+		itemLength, itemWidth, itemHeight := item.LengthCM, item.WidthCM, item.HeightCM
+		if itemLength <= 0 {
+			itemLength = product.LengthCM
+		}
+		if itemWidth <= 0 {
+			itemWidth = product.WidthCM
+		}
+		if itemHeight <= 0 {
+			itemHeight = product.HeightCM
+		}
+		if weight <= 0 || itemLength <= 0 || itemWidth <= 0 || itemHeight <= 0 {
+			if h.cfg.Environment == "production" {
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Product weight and package dimensions are required before shipment creation", "product_id": item.ProductID, "code": errcodes.EShipCreateFailed.Code})
+				return
+			}
+			weight, itemLength, itemWidth, itemHeight = 500, 30, 25, 5
+		}
+		weightGrams += weight * item.Quantity
+		if itemLength > lengthCM {
+			lengthCM = itemLength
+		}
+		if itemWidth > widthCM {
+			widthCM = itemWidth
+		}
+		// Conservatively stack package heights. This avoids under-declaring the
+		// parcel until a packing service supplies exact cartonization.
+		heightCM += itemHeight * item.Quantity
+	}
+
+	// Claim shipment creation before calling the courier. This closes the
+	// check-then-act race where two admin requests could buy two labels.
+	lockCutoff := time.Now().Add(-10 * time.Minute)
+	lockResult, lockErr := h.db.Collection("orders").UpdateOne(ctx, bson.M{
+		"_id":                              order.ID,
+		"status":                           bson.M{"$in": []string{"confirmed", "processing"}},
+		"shipment_id":                      bson.M{"$in": []interface{}{"", nil}},
+		"shipment_reconciliation_required": bson.M{"$ne": true},
+		"$or": []bson.M{
+			{"shipment_booking": bson.M{"$ne": true}},
+			{"shipment_booking_started_at": bson.M{"$lt": lockCutoff}},
+		},
+	}, bson.M{"$set": bson.M{"shipment_booking": true, "shipment_booking_started_at": time.Now()}})
+	if lockErr != nil || lockResult.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Shipment creation is already in progress or completed", "code": errcodes.EShprAlreadyShipped.Code})
+		return
+	}
+	bookingComplete := false
+	defer func() {
+		if !bookingComplete {
+			h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID, "shipment_booking": true}, bson.M{"$unset": bson.M{"shipment_booking": "", "shipment_booking_started_at": ""}})
+		}
+	}()
+
 	// Call provider
 	result, err := h.provider.CreateShipment(ctx, ShipmentRequest{
 		OrderNumber:    order.OrderNumber,
@@ -98,10 +186,10 @@ func (h *Handler) CreateShipment(c *gin.Context) {
 		CustomerPhone:  order.ShippingAddress.Phone,
 		Address:        order.ShippingAddress,
 		Items:          order.Items,
-		WeightGrams:    500, // default
-		LengthCM:       30,
-		WidthCM:        25,
-		HeightCM:       5,
+		WeightGrams:    weightGrams,
+		LengthCM:       lengthCM,
+		WidthCM:        widthCM,
+		HeightCM:       heightCM,
 	})
 	if err != nil {
 		log.ErrorWithCode("SHIP", errcodes.EShipCreateFailed.Code, "Provider shipment creation failed", "order_id", orderID, "err", err)
@@ -118,22 +206,41 @@ func (h *Handler) CreateShipment(c *gin.Context) {
 		TrackingURL: result.TrackingURL,
 		LabelURL:    result.LabelURL,
 		Status:      "booked",
-		Weight:      500,
-		Length:      30,
-		Width:       25,
-		Height:      5,
+		Weight:      weightGrams,
+		Length:      lengthCM,
+		Width:       widthCM,
+		Height:      heightCM,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
-	h.db.Collection("shipments").InsertOne(ctx, shipment)
+	if _, err := h.db.Collection("shipments").InsertOne(ctx, shipment); err != nil {
+		bookingComplete = true // keep the lock: provider outcome must be reconciled before retry
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"shipment_reconciliation_required": true, "shipment_reconciliation_awb": result.AWB, "updated_at": time.Now()}})
+		log.ErrorWithCode("SHIP", errcodes.EShipCreateFailed.Code, "Shipment booked but local record failed", "order_id", order.ID, "awb", result.AWB, "err", err)
+		c.Set("audit_provider_reference", result.AWB)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Shipment was booked but requires reconciliation", "awb": result.AWB, "code": errcodes.EShipCreateFailed.Code})
+		return
+	}
 
-	// Update order to shipped state-machine-safely (only if still confirmed/processing)
-	h.db.Collection("orders").UpdateOne(ctx,
-		bson.M{"_id": order.ID, "status": bson.M{"$in": []string{"confirmed", "processing"}}},
-		bson.M{"$set": bson.M{
-			"tracking_id": shipment.AWB, "tracking_url": shipment.TrackingURL,
-			"shipment_id": shipment.ID, "status": "shipped", "updated_at": time.Now(),
-		}})
+	// Update the claimed order and clear the booking lock in the same write.
+	updateResult, updateErr := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": order.ID, "shipment_booking": true},
+		bson.M{
+			"$set": bson.M{
+				"tracking_id": shipment.AWB, "tracking_url": shipment.TrackingURL,
+				"shipment_id": shipment.ID, "status": "shipped", "updated_at": time.Now(),
+			},
+			"$unset": bson.M{"shipment_booking": "", "shipment_booking_started_at": ""},
+		})
+	if updateErr != nil || updateResult.MatchedCount == 0 {
+		bookingComplete = true // keep the lock: the booked AWB requires reconciliation
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"shipment_reconciliation_required": true, "shipment_reconciliation_awb": result.AWB, "updated_at": time.Now()}})
+		log.ErrorWithCode("SHIP", errcodes.EShipCreateFailed.Code, "Shipment booked but order update failed", "order_id", order.ID, "awb", result.AWB, "err", updateErr)
+		c.Set("audit_provider_reference", result.AWB)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Shipment was booked but order reconciliation requires attention", "awb": result.AWB, "code": errcodes.EShipCreateFailed.Code})
+		return
+	}
+	bookingComplete = true
 
 	log.Info("SHIP", "Shipment created", "order_id", order.ID, "awb", result.AWB, "courier", result.CourierName)
 
@@ -147,6 +254,7 @@ func (h *Handler) CreateShipment(c *gin.Context) {
 		h.notifier.OrderShipped(&order, &user, result.AWB, result.CourierName, result.TrackingURL)
 	}
 
+	c.Set("audit_provider_reference", result.AWB)
 	c.JSON(http.StatusCreated, shipment)
 }
 

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"ecom-core-service/internal/config"
 	"ecom-core-service/internal/models"
 )
 
@@ -86,5 +87,16 @@ func TestMockProviderTrack(t *testing.T) {
 	}
 	if events[0].Status != "picked_up" {
 		t.Errorf("first event status: got %q, want %q", events[0].Status, "picked_up")
+	}
+}
+
+func TestProductionServiceabilityRequiresProvider(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{Environment: "production"}}
+	serviceable, err := handler.IsServiceable(context.Background(), "121003", 0)
+	if err == nil {
+		t.Fatal("expected a configuration error when production courier credentials are absent")
+	}
+	if serviceable {
+		t.Fatal("production must not report synthetic serviceability")
 	}
 }

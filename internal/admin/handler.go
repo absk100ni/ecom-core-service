@@ -162,9 +162,22 @@ func (h *Handler) Stats(c *gin.Context) {
 	productCount, _ := h.db.Collection("products").CountDocuments(ctx, bson.M{"is_active": true})
 
 	totalRevenue := 0
+	grossCollected := bson.M{"$cond": bson.A{
+		bson.M{"$eq": bson.A{"$payment_plan", "partial"}},
+		bson.M{"$add": bson.A{
+			bson.M{"$ifNull": bson.A{"$advance_amount", 0}},
+			bson.M{"$cond": bson.A{"$cod_collected", bson.M{"$ifNull": bson.A{"$cod_amount", 0}}, 0}},
+		}},
+		bson.M{"$ifNull": bson.A{"$total", 0}},
+	}}
+	netCollected := bson.M{"$max": bson.A{
+		0,
+		bson.M{"$subtract": bson.A{grossCollected, bson.M{"$ifNull": bson.A{"$refund_amount", 0}}}},
+	}}
 	revCursor, err := h.db.Collection("orders").Aggregate(ctx, mongo.Pipeline{
-		{{Key: "$match", Value: bson.M{"payment_status": "paid"}}},
-		{{Key: "$group", Value: bson.M{"_id": nil, "total": bson.M{"$sum": "$total"}}}},
+		{{Key: "$match", Value: bson.M{"payment_status": bson.M{"$in": []string{"paid", "refund_pending", "refunded"}}}}},
+		{{Key: "$project", Value: bson.M{"collected": netCollected}}},
+		{{Key: "$group", Value: bson.M{"_id": nil, "total": bson.M{"$sum": "$collected"}}}},
 	})
 	if err == nil {
 		var res []struct {

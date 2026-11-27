@@ -36,7 +36,7 @@ Server starts on **http://localhost:8080**. Health: `GET /health`.
 
 ## ❌ Left for launch
 
-- [ ] Deploy: Railway (backend) + MongoDB Atlas + Upstash Redis
+- [ ] Configure a private S3 bucket behind CloudFront/OAC and set `S3_PUBLIC_BASE_URL`
 - [ ] Register live webhooks: Razorpay + Shipmozo → `https://api.lucubraelec.in/...`
 - [ ] Razorpay live-mode keys (KYC pending; test-mode works now)
 - [ ] Meta/WhatsApp Business credentials (notifications currently mock/logged)
@@ -54,7 +54,7 @@ Admin: products/categories/coupons CRUD, `GET /admin/orders?q=&status=&payment_s
 | Variable | Required | Description |
 |----------|----------|-------------|
 | MONGO_URI / MONGO_DB | Yes | MongoDB connection |
-| REDIS_URL | Yes | Cache + serviceability cache |
+| REDIS_ADDR | No | Optional cache + shared rate limiter; local limiter is used when unavailable |
 | JWT_SECRET | Yes (prod) | JWT signing key |
 | GOOGLE_CLIENT_ID | Yes (prod) | Google OAuth |
 | GUEST_TOKEN_SECRET | Yes (prod) | HMAC key for guest tokens (fail-closed) |
@@ -69,3 +69,18 @@ Admin: products/categories/coupons CRUD, `GET /admin/orders?q=&status=&payment_s
 
 ## 📄 License
 MIT
+
+## Operations readiness
+
+The service exposes process liveness at `GET /live` and dependency/configuration readiness at `GET /ready`. Railway checks `/ready`; the container checks `/live`.
+
+Production must explicitly configure `BIND_HOST`, non-default JWT and guest secrets, explicit HTTPS CORS origins, the selected payment gateway and webhook secret, Shipmozo credentials plus webhook token, S3 with `S3_PUBLIC_BASE_URL`, and complete business invoice identity. Startup fails closed when required configuration is unsafe.
+
+Operational scanning is read-only. Configure:
+
+- `OPS_MONITOR_INTERVAL_MINUTES` (default `5`)
+- `OPS_SHIPMENT_STALE_MINUTES` (default `120`)
+- `OPS_REFUND_STALE_MINUTES` (default `60`)
+- `SENTRY_MAX_EVENTS_PER_HOUR` (default `20`)
+
+Authenticated administrators can inspect `/api/v1/admin/ops/status`, `/api/v1/admin/ops/anomalies`, and `/api/v1/admin/ops/audit`. See `OPS_RUNBOOK.md` before reconciling payment, refund, inventory, or shipment state.
