@@ -81,6 +81,7 @@ func (h *Handler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create coupon"})
 		return
 	}
+	c.Set("audit_resource_id", coupon.ID)
 	c.JSON(http.StatusCreated, coupon)
 }
 

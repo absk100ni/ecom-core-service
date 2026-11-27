@@ -67,7 +67,7 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 	rev.UserPhone = user.Phone
 	rev.IsVerified = deliveredCount > 0
-	rev.IsApproved = true // Auto-approve; admin can reject later
+	rev.IsApproved = false // require moderation before public display
 	if rev.Images == nil {
 		rev.Images = []string{}
 	}

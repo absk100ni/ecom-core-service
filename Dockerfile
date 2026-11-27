@@ -13,17 +13,17 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /app/serv
 # ==================== PRODUCTION STAGE ====================
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN addgroup -S app && adduser -S app -G app && \
+    apk add --no-cache ca-certificates tzdata curl
 
 WORKDIR /app
-COPY --from=builder /app/server .
+COPY --from=builder --chown=app:app /app/server .
 
-# Create upload directory
-RUN mkdir -p /tmp/ecom-uploads
+USER app
 
 # Health check for Railway/Docker
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
+  CMD curl -f http://localhost:${PORT:-8080}/live || exit 1
 
 EXPOSE 8080
 

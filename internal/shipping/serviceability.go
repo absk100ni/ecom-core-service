@@ -61,6 +61,10 @@ func (h *Handler) CheckServiceability(c *gin.Context) {
 
 	// 2. Resolve (Shiprocket when configured, else mock)
 	s := h.resolveServiceability(pincode)
+	if s.Source == "unavailable" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Delivery availability could not be confirmed. Please try again.", "code": errcodes.EShipServiceLookupFailed.Code})
+		return
+	}
 
 	// 3. Populate the human-readable EDD from the day estimate
 	if s.Serviceable && s.EstDays > 0 {
@@ -84,7 +88,7 @@ func (h *Handler) resolveServiceability(pincode string) Serviceability {
 	if h.cfg.ShipmozoPublicKey != "" && h.cfg.ShipmozoPrivateKey != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		if _, ok, err := h.provider.CheckServiceability(ctx, pincode, 0); err == nil {
+		if _, ok, err := h.provider.CheckServiceability(ctx, pincode, 100); err == nil {
 			return Serviceability{
 				Pincode:      pincode,
 				Serviceable:  ok,
@@ -105,6 +109,12 @@ func (h *Handler) resolveServiceability(pincode string) Serviceability {
 			log.WarnWithCode("SERVICEABILITY", errcodes.EShipServiceLookupFailed.Code,
 				"Shiprocket lookup failed, falling back to mock", "pincode", pincode, "err", err.Error())
 		}
+	}
+	if h.cfg.Environment == "production" {
+		// Never invent a deliverable lane in production. An unavailable courier
+		// check is represented as not serviceable so checkout cannot promise or
+		// sell delivery it has not confirmed.
+		return Serviceability{Pincode: pincode, Serviceable: false, CODAvailable: false, Source: "unavailable"}
 	}
 	return mockServiceability(pincode)
 }
@@ -217,4 +227,20 @@ func atoiSafe(s string) int {
 		return 0
 	}
 	return n
+}
+
+// IsServiceable is the checkout-facing delivery gate. Production never falls
+// back to synthetic availability when the courier cannot verify the lane.
+func (h *Handler) IsServiceable(ctx context.Context, pincode string, codAmountPaise int) (bool, error) {
+	if !pincodeRe.MatchString(pincode) {
+		return false, fmt.Errorf("invalid pincode")
+	}
+	if h.cfg.ShipmozoPublicKey != "" && h.cfg.ShipmozoPrivateKey != "" {
+		_, ok, err := h.provider.CheckServiceability(ctx, pincode, codAmountPaise)
+		return ok, err
+	}
+	if h.cfg.Environment == "production" {
+		return false, fmt.Errorf("courier serviceability provider is not configured")
+	}
+	return mockServiceability(pincode).Serviceable, nil
 }

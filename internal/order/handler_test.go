@@ -2,6 +2,8 @@ package order
 
 import (
 	"testing"
+
+	"ecom-core-service/internal/models"
 )
 
 // ComputeAdvance is a pure function extracted for testability.
@@ -109,5 +111,23 @@ func TestPaymentAmountSelection(t *testing.T) {
 				t.Errorf("chargeAmount: got %d, want %d", chargeAmount, tt.wantCharge)
 			}
 		})
+	}
+}
+
+func TestStockIncrementIncludesVariantWhenSelected(t *testing.T) {
+	item := models.OrderItem{ProductID: "product-a", VariantID: "variant-a", Quantity: 2}
+	increments := stockIncrement(item, -item.Quantity)
+	if increments["stock"] != -2 {
+		t.Fatalf("product stock increment = %v, want -2", increments["stock"])
+	}
+	if increments["variants.$[variant].stock"] != -2 {
+		t.Fatalf("variant stock increment = %v, want -2", increments["variants.$[variant].stock"])
+	}
+}
+
+func TestStockIncrementOmitsVariantForBaseProduct(t *testing.T) {
+	increments := stockIncrement(models.OrderItem{ProductID: "product-a", Quantity: 1}, 1)
+	if _, exists := increments["variants.$[variant].stock"]; exists {
+		t.Fatal("base product stock update must not include a variant array update")
 	}
 }

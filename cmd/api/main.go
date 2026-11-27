@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +24,7 @@ import (
 	"ecom-core-service/internal/invoice"
 	"ecom-core-service/internal/middleware"
 	"ecom-core-service/internal/notify"
+	"ecom-core-service/internal/ops"
 	"ecom-core-service/internal/order"
 	"ecom-core-service/internal/payment"
 	"ecom-core-service/internal/product"
@@ -46,6 +49,9 @@ var appLog = logger.New("APP", "STARTUP")
 
 func main() {
 	cfg := config.Load()
+	if err := config.ValidateProduction(cfg); err != nil {
+		log.Fatalf("Production readiness validation failed: %v", err)
+	}
 
 	// Initialize structured logging
 	isProduction := cfg.Environment == "production"
@@ -83,6 +89,9 @@ func main() {
 
 	db := mongoClient.Database(cfg.MongoDB)
 	ensureIndexes(db)
+	if err := ensureCriticalIndexes(db); err != nil {
+		log.Fatalf("Critical database index setup failed: %v", err)
+	}
 
 	// Redis cache
 	appCache := cache.New(cfg.RedisAddr)
@@ -93,7 +102,8 @@ func main() {
 	}
 
 	// Sentry client (no-op when DSN unset or non-production)
-	sentryClient := sentry.New(cfg.SentryDSN, cfg.Environment)
+	sentryClient := sentry.NewWithLimit(cfg.SentryDSN, cfg.Environment, cfg.SentryMaxEventsPerHour)
+	opsService := ops.New(db, cfg, sentryClient)
 
 	r := gin.New()
 	r.Use(middleware.SentryRecoveryMiddleware(sentryClient))
@@ -150,16 +160,12 @@ func main() {
 		})
 	}
 
-	// Health check
-	r.GET("/health", func(c *gin.Context) {
-		hCtx, hCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer hCancel()
-		if err := mongoClient.Ping(hCtx, nil); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy", "db": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "ecom-core-service", "version": "3.0", "time": time.Now().Format(time.RFC3339)})
-	})
+	// Liveness is process-only; readiness includes required dependencies.
+	r.GET("/live", ops.Live)
+	r.GET("/ready", opsService.Ready)
+
+	// Backward-compatible minimal readiness endpoint.
+	r.GET("/health", opsService.Ready)
 
 	// Init handlers
 	authH := auth.NewHandler(db, cfg)
@@ -168,6 +174,7 @@ func main() {
 	orderH := order.NewHandler(db, cfg)
 	paymentH := payment.NewHandler(db, cfg)
 	shippingH := shipping.NewHandler(db, cfg, appCache)
+	orderH.WithServiceabilityChecker(shippingH)
 	uploadH := upload.NewHandler(cfg)
 	couponH := coupon.NewHandler(db)
 	wishlistH := wishlist.NewHandler(db)
@@ -188,12 +195,19 @@ func main() {
 	// Seed admin
 	adminH.SeedAdmin()
 
-	// P0-1: Start background order expiry sweeper
+	// Background maintenance. The operations monitor is read-only for business state.
 	order.StartExpirySweeper(db, cfg)
+	monitorCtx, stopMonitor := context.WithCancel(context.Background())
+	defer stopMonitor()
+	opsService.Start(monitorCtx)
 
+	checkoutGuard := middleware.RequireCheckoutEnabled(cfg.CheckoutEnabled)
 	api := r.Group("/api/v1")
 	{
 		// ==================== PUBLIC ====================
+		api.GET("/checkout/status", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"enabled": cfg.CheckoutEnabled})
+		})
 		api.POST("/auth/send-otp", authH.SendOTP)
 		api.POST("/auth/verify-otp", authH.VerifyOTP)
 		api.POST("/auth/google", authH.GoogleSignIn)
@@ -216,8 +230,8 @@ func main() {
 		guestGroup := api.Group("/guest")
 		guestGroup.Use(middleware.RateLimitMiddleware(appCache, 20, time.Minute))
 		{
-			guestGroup.POST("/orders", guestH.CreateOrder)
-			guestGroup.POST("/payment/create", guestH.CreatePayment)
+			guestGroup.POST("/orders", checkoutGuard, guestH.CreateOrder)
+			guestGroup.POST("/payment/create", checkoutGuard, guestH.CreatePayment)
 			guestGroup.POST("/payment/verify", guestH.VerifyPayment)
 			guestGroup.POST("/orders/:id/abandon", guestH.Abandon)
 			guestGroup.GET("/orders/track", guestH.Track)
@@ -234,7 +248,7 @@ func main() {
 		protected.PUT("/cart/item/:productId", cartH.UpdateQuantity)
 		protected.DELETE("/cart", cartH.Clear)
 
-		protected.POST("/orders", orderH.Create)
+		protected.POST("/orders", checkoutGuard, orderH.Create)
 		protected.GET("/orders", orderH.List)
 		protected.GET("/orders/:id", orderH.Get)
 		protected.POST("/orders/:id/cancel", orderH.Cancel)
@@ -244,7 +258,7 @@ func main() {
 		protected.POST("/orders/:id/return", returnsH.Create)
 		protected.GET("/orders/:id/return", returnsH.Get)
 
-		protected.POST("/payment/create", paymentH.Create)
+		protected.POST("/payment/create", checkoutGuard, paymentH.Create)
 		protected.POST("/payment/verify", paymentH.Verify)
 
 		protected.GET("/shipping/track/:orderId", shippingH.Track)
@@ -280,7 +294,13 @@ func main() {
 	// Admin routes — require admin JWT with role=admin claim
 	adminGroup := api.Group("/admin")
 	adminGroup.Use(middleware.AdminAuthMiddleware(cfg.JWTSecret))
+	adminGroup.Use(ops.AuditMiddleware(db))
 	{
+		adminGroup.GET("/ops/status", opsService.Status)
+		adminGroup.GET("/ops/anomalies", opsService.ListAnomalies)
+		adminGroup.GET("/ops/audit", opsService.ListAudit)
+
+		adminGroup.GET("/products", productH.AdminList)
 		adminGroup.POST("/products", productH.Create)
 		adminGroup.PUT("/products/:id", productH.Update)
 		adminGroup.DELETE("/products/:id", productH.Delete)
@@ -329,10 +349,10 @@ func main() {
 		adminGroup.GET("/orders/:id/invoice", invoiceH.AdminGetInvoice)
 	}
 
-	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second}
+	srv := &http.Server{Addr: net.JoinHostPort(cfg.BindHost, cfg.Port), Handler: r, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second}
 
 	go func() {
-		log.Printf("🚀 E-Commerce Core Service v3.0 starting on port %s", cfg.Port)
+		log.Printf("🚀 E-Commerce Core Service v3.0 starting on %s:%s", cfg.BindHost, cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -395,8 +415,6 @@ func ensureIndexes(db *mongo.Database) {
 		{"orders", mongo.IndexModel{Keys: bson.D{{Key: "created_at", Value: -1}}}},
 		{"payments", mongo.IndexModel{Keys: bson.D{{Key: "order_id", Value: 1}}}},
 		{"payments", mongo.IndexModel{Keys: bson.D{{Key: "razorpay_order_id", Value: 1}}}},
-		{"shipments", mongo.IndexModel{Keys: bson.D{{Key: "order_id", Value: 1}}}},
-		{"shipments", mongo.IndexModel{Keys: bson.D{{Key: "awb", Value: 1}}}},
 		{"coupons", mongo.IndexModel{Keys: bson.D{{Key: "code", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"wishlists", mongo.IndexModel{Keys: bson.D{{Key: "user_id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"reviews", mongo.IndexModel{Keys: bson.D{{Key: "product_id", Value: 1}, {Key: "created_at", Value: -1}}}},
@@ -412,6 +430,11 @@ func ensureIndexes(db *mongo.Database) {
 		// Contact messages
 		{"contact_messages", mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}, {Key: "created_at", Value: -1}}}},
 		{"contact_messages", mongo.IndexModel{Keys: bson.D{{Key: "created_at", Value: -1}}}},
+		// Operational readiness
+		{"ops_anomalies", mongo.IndexModel{Keys: bson.D{{Key: "active", Value: 1}, {Key: "severity", Value: 1}, {Key: "last_seen", Value: -1}}}},
+		{"admin_audit_events", mongo.IndexModel{Keys: bson.D{{Key: "timestamp", Value: -1}}}},
+		{"admin_audit_events", mongo.IndexModel{Keys: bson.D{{Key: "resource_id", Value: 1}, {Key: "timestamp", Value: -1}}}},
+		{"ops_leases", mongo.IndexModel{Keys: bson.D{{Key: "expires_at", Value: 1}}}},
 	}
 
 	for _, idx := range indexes {
@@ -423,6 +446,40 @@ func ensureIndexes(db *mongo.Database) {
 	log.Println("✅ MongoDB indexes ensured")
 }
 
+func ensureCriticalIndexes(db *mongo.Database) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Replace legacy non-unique shipment indexes. A duplicate already present in
+	// the collection makes unique creation fail and therefore blocks startup.
+	for _, name := range []string{"order_id_1", "awb_1"} {
+		if _, err := db.Collection("shipments").Indexes().DropOne(ctx, name); err != nil &&
+			!strings.Contains(strings.ToLower(err.Error()), "index not found") &&
+			!strings.Contains(strings.ToLower(err.Error()), "ns not found") {
+			return fmt.Errorf("drop legacy shipment index %s: %w", name, err)
+		}
+	}
+
+	critical := []struct {
+		collection string
+		model      mongo.IndexModel
+	}{
+		{"payments", mongo.IndexModel{
+			Keys: bson.D{{Key: "order_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("one_active_payment_per_order").
+				SetPartialFilterExpression(bson.M{"status": "created"}),
+		}},
+		{"shipments", mongo.IndexModel{Keys: bson.D{{Key: "order_id", Value: 1}}, Options: options.Index().SetUnique(true).SetName("shipment_order_unique")}},
+		{"shipments", mongo.IndexModel{Keys: bson.D{{Key: "awb", Value: 1}}, Options: options.Index().SetUnique(true).SetName("shipment_awb_unique")}},
+	}
+	for _, index := range critical {
+		if _, err := db.Collection(index.collection).Indexes().CreateOne(ctx, index.model); err != nil {
+			return fmt.Errorf("create critical index %s: %w", *index.model.Options.Name, err)
+		}
+	}
+	return nil
+}
+
 // ==================== REVENUE ANALYTICS ====================
 func revenueAnalytics(db *mongo.Database) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -431,30 +488,46 @@ func revenueAnalytics(db *mongo.Database) gin.HandlerFunc {
 
 		thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
 
-		pipeline := mongo.Pipeline{{{Key: "$facet", Value: bson.M{
-			"paid_summary": []bson.M{
-				{"$match": bson.M{"payment_status": "paid"}},
-				{"$group": bson.M{"_id": nil, "revenue": bson.M{"$sum": "$total"}, "orders": bson.M{"$sum": 1}, "items": bson.M{"$sum": bson.M{"$size": bson.M{"$ifNull": bson.A{"$items", bson.A{}}}}}}},
-			},
-			"daily": []bson.M{
-				{"$match": bson.M{"payment_status": "paid", "created_at": bson.M{"$gte": thirtyDaysAgo}}},
-				{"$group": bson.M{"_id": bson.M{"$dateToString": bson.M{"format": "%Y-%m-%d", "date": "$created_at"}}, "revenue": bson.M{"$sum": "$total"}}},
-			},
-			"status_breakdown": []bson.M{
-				{"$group": bson.M{"_id": "$status", "count": bson.M{"$sum": 1}}},
-			},
-			"payment_breakdown": []bson.M{
-				{"$group": bson.M{"_id": "$payment_status", "count": bson.M{"$sum": 1}}},
-			},
-			"top_products": []bson.M{
-				{"$match": bson.M{"payment_status": "paid"}},
-				{"$unwind": "$items"},
-				{"$match": bson.M{"items.name": bson.M{"$exists": true, "$ne": ""}}},
-				{"$group": bson.M{"_id": "$items.name", "quantity": bson.M{"$sum": bson.M{"$ifNull": bson.A{"$items.quantity", 1}}}}},
-				{"$sort": bson.M{"quantity": -1}},
-				{"$limit": 10},
-			},
-		}}}}
+		grossCollected := bson.M{"$cond": bson.A{
+			bson.M{"$eq": bson.A{"$payment_plan", "partial"}},
+			bson.M{"$add": bson.A{
+				bson.M{"$ifNull": bson.A{"$advance_amount", 0}},
+				bson.M{"$cond": bson.A{"$cod_collected", bson.M{"$ifNull": bson.A{"$cod_amount", 0}}, 0}},
+			}},
+			bson.M{"$ifNull": bson.A{"$total", 0}},
+		}}
+		collectedAmount := bson.M{"$max": bson.A{
+			0,
+			bson.M{"$subtract": bson.A{grossCollected, bson.M{"$ifNull": bson.A{"$refund_amount", 0}}}},
+		}}
+		paidStatuses := bson.M{"$in": []string{"paid", "refund_pending", "refunded"}}
+		pipeline := mongo.Pipeline{
+			{{Key: "$set", Value: bson.M{"collected_amount": collectedAmount}}},
+			{{Key: "$facet", Value: bson.M{
+				"paid_summary": []bson.M{
+					{"$match": bson.M{"payment_status": paidStatuses}},
+					{"$group": bson.M{"_id": nil, "revenue": bson.M{"$sum": "$collected_amount"}, "orders": bson.M{"$sum": 1}, "items": bson.M{"$sum": bson.M{"$size": bson.M{"$ifNull": bson.A{"$items", bson.A{}}}}}}},
+				},
+				"daily": []bson.M{
+					{"$match": bson.M{"payment_status": paidStatuses, "created_at": bson.M{"$gte": thirtyDaysAgo}}},
+					{"$group": bson.M{"_id": bson.M{"$dateToString": bson.M{"format": "%Y-%m-%d", "date": "$created_at"}}, "revenue": bson.M{"$sum": "$collected_amount"}, "orders": bson.M{"$sum": 1}}},
+				},
+				"status_breakdown": []bson.M{
+					{"$group": bson.M{"_id": "$status", "count": bson.M{"$sum": 1}}},
+				},
+				"payment_breakdown": []bson.M{
+					{"$group": bson.M{"_id": "$payment_status", "count": bson.M{"$sum": 1}}},
+				},
+				"top_products": []bson.M{
+					{"$match": bson.M{"payment_status": paidStatuses}},
+					{"$unwind": "$items"},
+					{"$match": bson.M{"items.name": bson.M{"$exists": true, "$ne": ""}}},
+					{"$group": bson.M{"_id": "$items.name", "quantity": bson.M{"$sum": bson.M{"$ifNull": bson.A{"$items.quantity", 1}}}}},
+					{"$sort": bson.M{"quantity": -1}},
+					{"$limit": 10},
+				},
+			}}},
+		}
 
 		cursor, err := db.Collection("orders").Aggregate(ctx, pipeline)
 		if err != nil {
@@ -472,6 +545,7 @@ func revenueAnalytics(db *mongo.Database) gin.HandlerFunc {
 			Daily []struct {
 				Day     string `bson:"_id"`
 				Revenue int64  `bson:"revenue"`
+				Orders  int    `bson:"orders"`
 			} `bson:"daily"`
 			StatusBreakdown []struct {
 				Key   string `bson:"_id"`
@@ -502,15 +576,20 @@ func revenueAnalytics(db *mongo.Database) gin.HandlerFunc {
 		type dayRevenue struct {
 			Date    string `json:"date"`
 			Revenue int    `json:"revenue"`
+			Orders  int    `json:"orders"`
 		}
-		revByDay := make(map[string]int, len(f.Daily))
+		revByDay := make(map[string]dayRevenue, len(f.Daily))
 		for _, d := range f.Daily {
-			revByDay[d.Day] = int(d.Revenue)
+			revByDay[d.Day] = dayRevenue{Date: d.Day, Revenue: int(d.Revenue), Orders: d.Orders}
 		}
 		dailyArr := make([]dayRevenue, 0)
 		for d := thirtyDaysAgo; d.Before(time.Now().AddDate(0, 0, 1)); d = d.AddDate(0, 0, 1) {
 			day := d.Format("2006-01-02")
-			dailyArr = append(dailyArr, dayRevenue{Date: day, Revenue: revByDay[day]})
+			entry, ok := revByDay[day]
+			if !ok {
+				entry = dayRevenue{Date: day}
+			}
+			dailyArr = append(dailyArr, entry)
 		}
 
 		statusBreakdown := map[string]int{}

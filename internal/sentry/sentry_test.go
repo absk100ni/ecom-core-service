@@ -248,3 +248,22 @@ func TestPayloadShape(t *testing.T) {
 		t.Errorf("tags.path = %v, want '/api/v1/orders'", tags["path"])
 	}
 }
+
+func TestNewWithLimitAndOperationalDedupe(t *testing.T) {
+	c := NewWithLimit("https://key@o1234.ingest.sentry.io/999", "production", 2)
+	c.endpoint = "http://127.0.0.1:1"
+	if c.maxEventsPerHour != 2 {
+		t.Fatalf("maxEventsPerHour = %d", c.maxEventsPerHour)
+	}
+	tags := map[string]string{"event_code": "OPS_TEST", "resource_type": "order", "resource_id": "order-1"}
+	c.CaptureError("first wording", tags)
+	time.Sleep(20 * time.Millisecond)
+	c.CaptureError("changed wording", tags)
+	time.Sleep(20 * time.Millisecond)
+	c.mu.Lock()
+	count := c.count
+	c.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("operational event should dedupe by code and resource, count=%d", count)
+	}
+}

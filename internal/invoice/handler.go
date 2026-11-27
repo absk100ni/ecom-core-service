@@ -48,8 +48,8 @@ func (h *Handler) GetInvoice(c *gin.Context) {
 		return
 	}
 
-	if order.PaymentStatus != "paid" && order.AdvanceAmount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invoice available only for paid orders", "code": errcodes.EInvNotReady.Code})
+	if order.PaymentStatus != "paid" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invoice available only after payment is confirmed", "code": errcodes.EInvNotReady.Code})
 		return
 	}
 
@@ -70,8 +70,8 @@ func (h *Handler) AdminGetInvoice(c *gin.Context) {
 		return
 	}
 
-	if order.PaymentStatus != "paid" && order.AdvanceAmount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invoice available only for paid orders", "code": errcodes.EInvNotReady.Code})
+	if order.PaymentStatus != "paid" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invoice available only after payment is confirmed", "code": errcodes.EInvNotReady.Code})
 		return
 	}
 
@@ -81,6 +81,23 @@ func (h *Handler) AdminGetInvoice(c *gin.Context) {
 func (h *Handler) serveInvoice(c *gin.Context, order *models.Order) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	if h.cfg.BusinessLegalName == "" || h.cfg.BusinessAddress == "" || h.cfg.BusinessGSTIN == "" || h.cfg.BusinessState == "" || h.cfg.BusinessStateCode == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Business tax identity is incomplete; invoice cannot be issued", "code": errcodes.EInvNotReady.Code})
+		return
+	}
+
+	// Validate product tax data before allocating an invoice number.
+	productIDs := make([]string, 0, len(order.Items))
+	for _, item := range order.Items {
+		productIDs = append(productIDs, item.ProductID)
+	}
+	prodMap := h.fetchProducts(ctx, productIDs)
+	lines, lineErr := h.computeInvoiceLines(order, prodMap)
+	if lineErr != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": lineErr.Error(), "code": errcodes.EInvNotReady.Code})
+		return
+	}
 
 	// Assign invoice number if not already set (idempotent)
 	if order.InvoiceNumber == "" {
@@ -94,17 +111,6 @@ func (h *Handler) serveInvoice(c *gin.Context, order *models.Order) {
 		order.InvoiceDate = invDate
 	}
 
-	// Fetch products for HSN codes and GST rates
-	productIDs := make([]string, 0, len(order.Items))
-	for _, item := range order.Items {
-		productIDs = append(productIDs, item.ProductID)
-	}
-	prodMap := h.fetchProducts(ctx, productIDs)
-
-	// Compute tax lines
-	lines := h.computeInvoiceLines(order, prodMap)
-
-	// Determine intra vs inter state
 	buyerState := order.ShippingAddress.State
 	isIntra := h.isIntraState(buyerState)
 
@@ -186,25 +192,18 @@ type InvoiceLine struct {
 	LineTotal    int // paise (inclusive)
 }
 
-func (h *Handler) computeInvoiceLines(order *models.Order, prodMap map[string]*models.Product) []InvoiceLine {
-	defaultRate := h.cfg.DefaultGSTPercent
-	if defaultRate == 0 {
-		defaultRate = 18
-	}
-	defaultHSN := h.cfg.DefaultHSNCode
-
+func (h *Handler) computeInvoiceLines(order *models.Order, prodMap map[string]*models.Product) ([]InvoiceLine, error) {
 	lines := make([]InvoiceLine, 0, len(order.Items))
 	for _, item := range order.Items {
-		rate := defaultRate
-		hsn := defaultHSN
-		if p, ok := prodMap[item.ProductID]; ok {
-			if p.GSTPercent > 0 {
-				rate = p.GSTPercent
-			}
-			if p.HSNCode != "" {
-				hsn = p.HSNCode
-			}
+		product, ok := prodMap[item.ProductID]
+		if !ok {
+			return nil, fmt.Errorf("Tax data is unavailable for product %s", item.ProductID)
 		}
+		if product.GSTPercent <= 0 || product.GSTPercent > 100 || product.HSNCode == "" {
+			return nil, fmt.Errorf("GST rate and HSN code are required for %s", item.Name)
+		}
+		rate := product.GSTPercent
+		hsn := product.HSNCode
 		lineTotal := item.Price * item.Quantity // GST-inclusive paise
 		taxable := GSTInclusiveTaxable(lineTotal, rate)
 		gst := lineTotal - taxable
@@ -220,7 +219,7 @@ func (h *Handler) computeInvoiceLines(order *models.Order, prodMap map[string]*m
 			LineTotal:    lineTotal,
 		})
 	}
-	return lines
+	return lines, nil
 }
 
 // GSTInclusiveTaxable extracts taxable amount from GST-inclusive total

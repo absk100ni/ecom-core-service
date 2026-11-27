@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,7 +30,7 @@ import (
 var log = logger.New("GUEST", "CHECKOUT")
 
 var phoneRegex = regexp.MustCompile(`^\d{10}$`)
-var pincodeRegex = regexp.MustCompile(`^\d{6}$`)
+var pincodeRegex = regexp.MustCompile(`^[1-9]\d{5}$`)
 
 // Handler holds dependencies for guest checkout routes.
 type Handler struct {
@@ -103,6 +104,7 @@ type guestOrderRequest struct {
 
 type guestItem struct {
 	ProductID string `json:"product_id" binding:"required"`
+	VariantID string `json:"variant_id,omitempty"`
 	Quantity  int    `json:"quantity" binding:"required,gte=1"`
 }
 
@@ -156,16 +158,41 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Product %s not found or inactive", gi.ProductID), "code": errcodes.EGstInvalidItems.Code})
 			return
 		}
+		price := prod.Price
+		variantLabel := ""
+		if len(prod.Variants) > 0 && gi.VariantID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Select an option for %s", prod.Name), "code": errcodes.EGstInvalidItems.Code})
+			return
+		}
+		if gi.VariantID != "" {
+			variantFound := false
+			for _, variant := range prod.Variants {
+				if variant.ID == gi.VariantID {
+					variantFound = true
+					variantLabel = variant.Name + ": " + variant.Value
+					if variant.Price > 0 {
+						price = variant.Price
+					}
+					break
+				}
+			}
+			if !variantFound {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Selected option for %s is unavailable", prod.Name), "code": errcodes.EGstInvalidItems.Code})
+				return
+			}
+		}
 		img := ""
 		if len(prod.Images) > 0 {
 			img = prod.Images[0]
 		}
 		cartItems = append(cartItems, models.CartItem{
-			ProductID: prod.ID,
-			Name:      prod.Name,
-			Price:     prod.Price,
-			Quantity:  gi.Quantity,
-			Image:     img,
+			ProductID:    prod.ID,
+			VariantID:    gi.VariantID,
+			VariantLabel: variantLabel,
+			Name:         prod.Name,
+			Price:        price,
+			Quantity:     gi.Quantity,
+			Image:        img,
 		})
 	}
 
@@ -176,8 +203,19 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		log.Error("CREATE", "Guest order creation failed", "err", err.Error())
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order", "code": errcodes.EOrdCreateFailed.Code})
+		switch {
+		case errors.Is(err, order.ErrDeliveryUnavailable):
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error(), "code": errcodes.EOrdAddressInvalid.Code})
+		case errors.Is(err, order.ErrDeliveryCheckFailed):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Delivery availability could not be confirmed. Please try again.", "code": errcodes.EOrdCreateFailed.Code})
+		case errors.Is(err, order.ErrPriceChanged):
+			c.JSON(http.StatusConflict, gin.H{"error": "A product price changed. Return to your cart and review the new total.", "code": errcodes.EOrdCreateFailed.Code})
+		case errors.Is(err, order.ErrCouponInvalid):
+			c.JSON(http.StatusConflict, gin.H{"error": "The coupon is no longer available. Review the total and try again.", "code": errcodes.EOrdCreateFailed.Code})
+		default:
+			log.Error("CREATE", "Guest order creation failed", "err", err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order", "code": errcodes.EOrdCreateFailed.Code})
+		}
 		return
 	}
 
@@ -323,7 +361,7 @@ func (h *Handler) Track(c *gin.Context) {
 
 	var o models.Order
 	if err := h.db.Collection("orders").FindOne(ctx, bson.M{
-		"order_number":         orderNumber,
+		"order_number":           orderNumber,
 		"shipping_address.phone": phone,
 	}).Decode(&o); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Order not found or phone does not match", "code": errcodes.EGstTrackDenied.Code})
@@ -332,28 +370,29 @@ func (h *Handler) Track(c *gin.Context) {
 
 	// Safe subset — no user data, no internal IDs
 	type safeItem struct {
-		Name     string `json:"name"`
-		Quantity int    `json:"quantity"`
-		Image    string `json:"image,omitempty"`
-		Price    int    `json:"price"`
+		Name         string `json:"name"`
+		VariantLabel string `json:"variant_label,omitempty"`
+		Quantity     int    `json:"quantity"`
+		Image        string `json:"image,omitempty"`
+		Price        int    `json:"price"`
 	}
 	items := make([]safeItem, len(o.Items))
 	for i, it := range o.Items {
-		items[i] = safeItem{Name: it.Name, Quantity: it.Quantity, Image: it.Image, Price: it.Price}
+		items[i] = safeItem{Name: it.Name, VariantLabel: it.VariantLabel, Quantity: it.Quantity, Image: it.Image, Price: it.Price}
 	}
 
 	// Fetch tracking events if shipped
 	var tracking *struct {
-		AWB         string                `json:"awb,omitempty"`
-		CourierName string                `json:"courier_name,omitempty"`
+		AWB         string                 `json:"awb,omitempty"`
+		CourierName string                 `json:"courier_name,omitempty"`
 		Events      []models.TrackingEvent `json:"events,omitempty"`
 	}
 	if o.ShipmentID != "" {
 		var shipment models.Shipment
 		if err := h.db.Collection("shipments").FindOne(ctx, bson.M{"order_id": o.ID}).Decode(&shipment); err == nil {
 			tracking = &struct {
-				AWB         string                `json:"awb,omitempty"`
-				CourierName string                `json:"courier_name,omitempty"`
+				AWB         string                 `json:"awb,omitempty"`
+				CourierName string                 `json:"courier_name,omitempty"`
 				Events      []models.TrackingEvent `json:"events,omitempty"`
 			}{
 				AWB:         shipment.AWB,

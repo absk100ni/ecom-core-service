@@ -98,10 +98,10 @@ func ExpireOrder(ctx context.Context, db *mongo.Database, order *models.Order) b
 			"payment_status": "pending",
 		},
 		bson.M{"$set": bson.M{
-			"status":          "expired",
-			"cancel_reason":   "Payment not completed within allowed time",
-			"cancelled_at":    now,
-			"updated_at":      now,
+			"status":        "expired",
+			"cancel_reason": "Payment not completed within allowed time",
+			"cancelled_at":  now,
+			"updated_at":    now,
 		}},
 	)
 	if err != nil || res.MatchedCount == 0 {
@@ -131,7 +131,8 @@ func ReleaseStock(ctx context.Context, db *mongo.Database, order *models.Order) 
 	for _, item := range order.Items {
 		db.Collection("products").UpdateOne(ctx,
 			bson.M{"_id": item.ProductID},
-			bson.M{"$inc": bson.M{"stock": item.Quantity}},
+			bson.M{"$inc": stockIncrement(item, item.Quantity)},
+			stockArrayFilters(item),
 		)
 	}
 }
@@ -201,16 +202,22 @@ func ReclaimStock(ctx context.Context, db *mongo.Database, order *models.Order) 
 
 	reserved := make([]models.OrderItem, 0, len(order.Items))
 	for _, item := range order.Items {
+		filter := bson.M{"_id": item.ProductID, "is_active": true, "stock": bson.M{"$gte": item.Quantity}}
+		if item.VariantID != "" {
+			filter["variants"] = bson.M{"$elemMatch": bson.M{"id": item.VariantID, "stock": bson.M{"$gte": item.Quantity}}}
+		}
 		r, dErr := db.Collection("products").UpdateOne(ctx,
-			bson.M{"_id": item.ProductID, "is_active": true, "stock": bson.M{"$gte": item.Quantity}},
-			bson.M{"$inc": bson.M{"stock": -item.Quantity}},
+			filter,
+			bson.M{"$inc": stockIncrement(item, -item.Quantity)},
+			stockArrayFilters(item),
 		)
 		if dErr != nil || r.MatchedCount == 0 {
 			// Roll back what we reserved and restore the released flag.
 			for _, done := range reserved {
 				db.Collection("products").UpdateOne(ctx,
 					bson.M{"_id": done.ProductID},
-					bson.M{"$inc": bson.M{"stock": done.Quantity}},
+					bson.M{"$inc": stockIncrement(done, done.Quantity)},
+					stockArrayFilters(done),
 				)
 			}
 			db.Collection("orders").UpdateOne(ctx,
