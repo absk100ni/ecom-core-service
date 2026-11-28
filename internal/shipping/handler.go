@@ -37,6 +37,14 @@ func NewHandler(db *mongo.Database, cfg *config.Config, c *cache.Cache) *Handler
 // WithNotifier injects the notification service (optional — nil means no notifications).
 func (h *Handler) WithNotifier(n *notify.Notifier) *Handler { h.notifier = n; return h }
 
+// PushOrder creates an unassigned Shipmozo order for manual courier selection.
+func (h *Handler) PushOrder(c *gin.Context) {
+	query := c.Request.URL.Query()
+	query.Set("push_only", "true")
+	c.Request.URL.RawQuery = query.Encode()
+	h.CreateShipment(c)
+}
+
 // CreateShipment — POST /api/v1/admin/orders/:id/ship (IDEMPOTENT)
 func (h *Handler) CreateShipment(c *gin.Context) {
 	orderID := c.Param("id")
@@ -159,6 +167,7 @@ func (h *Handler) CreateShipment(c *gin.Context) {
 		"_id":                              order.ID,
 		"status":                           bson.M{"$in": []string{"confirmed", "processing"}},
 		"shipment_id":                      bson.M{"$in": []interface{}{"", nil}},
+		"shipmozo_order_id":                bson.M{"$in": []interface{}{"", nil}},
 		"shipment_reconciliation_required": bson.M{"$ne": true},
 		"$or": []bson.M{
 			{"shipment_booking": bson.M{"$ne": true}},
@@ -176,42 +185,60 @@ func (h *Handler) CreateShipment(c *gin.Context) {
 		}
 	}()
 
-	// Call provider
-	result, err := h.provider.CreateShipment(ctx, ShipmentRequest{
-		OrderNumber:    order.OrderNumber,
-		OrderDate:      order.CreatedAt,
-		PaymentType:    paymentType,
-		CODAmountPaise: codAmount,
-		CustomerName:   order.ShippingAddress.Name,
-		CustomerPhone:  order.ShippingAddress.Phone,
-		Address:        order.ShippingAddress,
-		Items:          order.Items,
-		WeightGrams:    weightGrams,
-		LengthCM:       lengthCM,
-		WidthCM:        widthCM,
-		HeightCM:       heightCM,
-	})
+	request := ShipmentRequest{
+		OrderNumber: order.OrderNumber, OrderDate: order.CreatedAt, PaymentType: paymentType, CODAmountPaise: codAmount,
+		CustomerName: order.ShippingAddress.Name, CustomerPhone: order.ShippingAddress.Phone, Address: order.ShippingAddress,
+		Items: order.Items, WeightGrams: weightGrams, LengthCM: lengthCM, WidthCM: widthCM, HeightCM: heightCM,
+	}
+	pushOnly := c.Query("push_only") == "true"
+	var result ShipmentResult
+	var err error
+	if pushOnly {
+		result, err = h.provider.PushOrder(ctx, request)
+	} else {
+		result, err = h.provider.CreateShipment(ctx, request)
+	}
 	if err != nil {
-		log.ErrorWithCode("SHIP", errcodes.EShipCreateFailed.Code, "Provider shipment creation failed", "order_id", orderID, "err", err)
+		// Provider timeouts are ambiguous: Shipmozo may have accepted the order.
+		// Keep the claim locked until reconciliation by our order/reference ID.
+		bookingComplete = true
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"shipment_reconciliation_required": true, "shipment_reconciliation_error": err.Error(), "updated_at": time.Now()}})
+		log.ErrorWithCode("SHIP", errcodes.EShipCreateFailed.Code, "Provider shipment creation failed; reconciliation required", "order_id", orderID, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errcodes.EShipCreateFailed.Message, "code": errcodes.EShipCreateFailed.Code})
 		return
 	}
 
+	if pushOnly {
+		updateResult, updateErr := h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": order.ID, "shipment_booking": true}, bson.M{"$set": bson.M{"shipmozo_order_id": result.ProviderOrderID, "shipmozo_push_status": "awaiting_courier", "status": "processing", "updated_at": time.Now()}, "$unset": bson.M{"shipment_booking": "", "shipment_booking_started_at": ""}})
+		if updateErr != nil || updateResult.MatchedCount == 0 {
+			bookingComplete = true
+			h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"shipment_reconciliation_required": true, "shipmozo_order_id": result.ProviderOrderID, "updated_at": time.Now()}})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Order reached Shipmozo but local reconciliation is required", "provider_order_id": result.ProviderOrderID, "code": errcodes.EShipCreateFailed.Code})
+			return
+		}
+		bookingComplete = true
+		c.Set("audit_provider_reference", result.ProviderOrderID)
+		c.JSON(http.StatusCreated, gin.H{"status": "awaiting_courier", "provider_order_id": result.ProviderOrderID, "message": "Order pushed to Shipmozo. Assign courier in Shipmozo dashboard."})
+		return
+	}
+
 	shipment := models.Shipment{
-		ID:          uuid.New().String(),
-		OrderID:     order.ID,
-		Provider:    "shipmozo",
-		AWB:         result.AWB,
-		CourierName: result.CourierName,
-		TrackingURL: result.TrackingURL,
-		LabelURL:    result.LabelURL,
-		Status:      "booked",
-		Weight:      weightGrams,
-		Length:      lengthCM,
-		Width:       widthCM,
-		Height:      heightCM,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		ID:                 uuid.New().String(),
+		OrderID:            order.ID,
+		Provider:           "shipmozo",
+		AWB:                result.AWB,
+		CourierName:        result.CourierName,
+		TrackingURL:        result.TrackingURL,
+		LabelURL:           result.LabelURL,
+		Status:             "booked",
+		ProviderStatus:     "booked",
+		NextTrackingPollAt: time.Now().Add(60 * time.Minute),
+		Weight:             weightGrams,
+		Length:             lengthCM,
+		Width:              widthCM,
+		Height:             heightCM,
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
 	}
 	if _, err := h.db.Collection("shipments").InsertOne(ctx, shipment); err != nil {
 		bookingComplete = true // keep the lock: provider outcome must be reconciled before retry
@@ -281,17 +308,21 @@ func (h *Handler) Track(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Shipment not found", "code": errcodes.EShipNotFound.Code})
 		return
 	}
+	// Customer refreshes never call Shipmozo synchronously. A stale snapshot is
+	// marked due for the leased poller, preventing browser-driven API stampedes.
+	if !shipment.TrackingTerminal && (shipment.LastTrackingPollAt == nil || time.Since(*shipment.LastTrackingPollAt) > 15*time.Minute) {
+		h.db.Collection("shipments").UpdateOne(ctx, bson.M{"_id": shipment.ID}, bson.M{"$set": bson.M{"next_tracking_poll_at": time.Now()}})
+	}
 
 	events := shipment.Events
 	if events == nil {
 		events = []models.TrackingEvent{}
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"status":       shipment.Status,
-		"awb":          shipment.AWB,
-		"courier":      shipment.CourierName,
-		"tracking_url": shipment.TrackingURL,
-		"events":       events,
+		"status": shipment.Status, "provider_status": shipment.ProviderStatus,
+		"awb": shipment.AWB, "courier": shipment.CourierName,
+		"tracking_url": shipment.TrackingURL, "expected_delivery_date": shipment.EstDelivery,
+		"last_updated": shipment.LastTrackingPollAt, "events": events,
 	})
 }
 

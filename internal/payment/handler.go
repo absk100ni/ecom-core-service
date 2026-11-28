@@ -304,6 +304,32 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 
+	// Claim provider-side payment creation before making an external call. This
+	// prevents concurrent requests from creating multiple independently payable
+	// gateway orders for the same store order.
+	claimToken := uuid.NewString()
+	claim, claimErr := h.db.Collection("orders").UpdateOne(ctx, bson.M{
+		"_id": order.ID, "payment_creation_lock": bson.M{"$ne": true}, "payment_reconciliation_required": bson.M{"$ne": true},
+	}, bson.M{"$set": bson.M{"payment_creation_lock": true, "payment_creation_token": claimToken, "payment_creation_started_at": time.Now()}})
+	if claimErr != nil || claim.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Payment creation is already in progress or requires reconciliation", "code": errcodes.EPayCreateFailed.Code})
+		return
+	}
+	claimResolved := false
+	defer func() {
+		if !claimResolved {
+			h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID, "payment_creation_token": claimToken}, bson.M{"$unset": bson.M{"payment_creation_lock": "", "payment_creation_token": "", "payment_creation_started_at": ""}})
+		}
+	}()
+	markAmbiguous := func(providerErr error) {
+		claimResolved = true
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID, "payment_creation_token": claimToken}, bson.M{"$set": bson.M{"payment_reconciliation_required": true, "payment_reconciliation_error": providerErr.Error(), "updated_at": time.Now()}})
+	}
+	completeClaim := func() {
+		claimResolved = true
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID, "payment_creation_token": claimToken}, bson.M{"$unset": bson.M{"payment_creation_lock": "", "payment_creation_token": "", "payment_creation_started_at": ""}})
+	}
+
 	log.Info("CREATE", "Creating payment", "gateway", gateway, "order_id", req.OrderID, "charge_amount", chargeAmount, "total", order.Total)
 
 	var gatewayOrderID, paymentSessionID, gatewayKeyID, stripeClientSecret, stripePaymentIntentID string
@@ -313,6 +339,7 @@ func (h *Handler) Create(c *gin.Context) {
 		paymentID := uuid.New().String()
 		pi, err := h.CreatePaymentIntent(chargeAmount, "INR", req.OrderID, paymentID, order.OrderNumber)
 		if err != nil {
+			markAmbiguous(err)
 			log.Error("CREATE", "Stripe PaymentIntent failed", "err", err.Error())
 			c.JSON(http.StatusBadGateway, gin.H{"error": "Payment gateway error: " + err.Error()})
 			return
@@ -328,11 +355,13 @@ func (h *Handler) Create(c *gin.Context) {
 			Status: "created", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}
 		if _, err := h.db.Collection("payments").InsertOne(ctx, payment); err != nil {
+			markAmbiguous(err)
 			log.Error("CREATE", "Failed to persist Stripe payment attempt", "order_id", order.ID, "err", err)
 			c.JSON(http.StatusConflict, gin.H{"error": "A payment attempt already exists. Please retry.", "code": errcodes.EPayCreateFailed.Code})
 			return
 		}
 
+		completeClaim()
 		log.Info("CREATE", "Stripe payment created", "payment_id", paymentID, "pi_id", stripePaymentIntentID)
 		c.JSON(http.StatusOK, gin.H{
 			"gateway":         "stripe",
@@ -349,6 +378,7 @@ func (h *Handler) Create(c *gin.Context) {
 	case "razorpay":
 		rzpOrderID, err := h.createRazorpayOrder(chargeAmount, "INR", order.OrderNumber)
 		if err != nil {
+			markAmbiguous(err)
 			log.Error("CREATE", "Razorpay order failed", "err", err.Error())
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway error: " + err.Error()})
 			return
@@ -359,6 +389,7 @@ func (h *Handler) Create(c *gin.Context) {
 	case "cashfree":
 		cfOrderID, sessionID, err := h.createCashfreeOrder(chargeAmount, "INR", order.ID, order.ShippingAddress.Phone, order.ShippingAddress.Name)
 		if err != nil {
+			markAmbiguous(err)
 			log.Error("CREATE", "Cashfree order failed", "err", err.Error())
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Payment gateway error: " + err.Error()})
 			return
@@ -386,11 +417,13 @@ func (h *Handler) Create(c *gin.Context) {
 		Status: "created", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if _, err := h.db.Collection("payments").InsertOne(ctx, payment); err != nil {
+		markAmbiguous(err)
 		log.Error("CREATE", "Failed to persist payment attempt", "order_id", order.ID, "gateway", gateway, "err", err)
 		c.JSON(http.StatusConflict, gin.H{"error": "A payment attempt already exists. Please retry.", "code": errcodes.EPayCreateFailed.Code})
 		return
 	}
 
+	completeClaim()
 	response := gin.H{
 		"payment_id":   payment.ID,
 		"gateway":      gateway,

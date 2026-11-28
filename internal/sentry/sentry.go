@@ -76,8 +76,9 @@ const (
 	sendTimeout             = 5 * time.Second
 )
 
-// New creates a Sentry client. Returns a disabled no-op client if dsn is empty
-// or environment is not "production".
+// New creates a Sentry client. Returns a disabled no-op client when the DSN is empty.
+// The environment is still attached to every event, allowing safe local/UAT
+// verification without mixing those events with production filters.
 func New(dsn, environment string) *Client {
 	return NewWithLimit(dsn, environment, defaultMaxEventsPerHour)
 }
@@ -94,7 +95,7 @@ func NewWithLimit(dsn, environment string, maxEventsPerHour int) *Client {
 		maxEventsPerHour: maxEventsPerHour,
 	}
 
-	if dsn == "" || environment != "production" {
+	if dsn == "" {
 		c.enabled = false
 		return c
 	}

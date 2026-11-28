@@ -50,6 +50,7 @@ type Product struct {
 	HSNCode        string    `json:"hsn_code,omitempty" bson:"hsn_code,omitempty"`               // HSN/SAC code
 	CreatedAt      time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at" bson:"updated_at"`
+	Version        int       `json:"version" bson:"version"`
 }
 
 type Variant struct {
@@ -81,6 +82,7 @@ type Cart struct {
 	Items     []CartItem `json:"items" bson:"items"`
 	CreatedAt time.Time  `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at" bson:"updated_at"`
+	Version   int        `json:"version" bson:"version"`
 }
 
 type CartItem struct {
@@ -98,6 +100,7 @@ type Order struct {
 	ID                    string         `json:"id" bson:"_id,omitempty"`
 	UserID                string         `json:"user_id" bson:"user_id"`
 	OrderNumber           string         `json:"order_number" bson:"order_number"`
+	IdempotencyKey        string         `json:"-" bson:"idempotency_key,omitempty"`
 	Items                 []OrderItem    `json:"items" bson:"items"`
 	Subtotal              int            `json:"subtotal" bson:"subtotal"`
 	ShippingCost          int            `json:"shipping_cost" bson:"shipping_cost"`
@@ -120,6 +123,8 @@ type Order struct {
 	TrackingID            string         `json:"tracking_id,omitempty" bson:"tracking_id,omitempty"`
 	TrackingURL           string         `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
 	ShipmentID            string         `json:"shipment_id,omitempty" bson:"shipment_id,omitempty"`
+	ShipmozoOrderID       string         `json:"shipmozo_order_id,omitempty" bson:"shipmozo_order_id,omitempty"`
+	ShipmozoPushStatus    string         `json:"shipmozo_push_status,omitempty" bson:"shipmozo_push_status,omitempty"`
 	IsGuest               bool           `json:"is_guest" bson:"is_guest"`
 	Notes                 string         `json:"notes,omitempty" bson:"notes,omitempty"`
 	CancelReason          string         `json:"cancel_reason,omitempty" bson:"cancel_reason,omitempty"`
@@ -191,23 +196,29 @@ type Payment struct {
 
 // ==================== SHIPPING ====================
 type Shipment struct {
-	ID          string          `json:"id" bson:"_id,omitempty"`
-	OrderID     string          `json:"order_id" bson:"order_id"`
-	Provider    string          `json:"provider" bson:"provider"`
-	ShipmentID  string          `json:"shipment_id" bson:"shipment_id"`
-	AWB         string          `json:"awb,omitempty" bson:"awb,omitempty"`
-	CourierName string          `json:"courier_name,omitempty" bson:"courier_name,omitempty"`
-	TrackingURL string          `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
-	LabelURL    string          `json:"label_url,omitempty" bson:"label_url,omitempty"`
-	Status      string          `json:"status" bson:"status"`
-	Events      []TrackingEvent `json:"events,omitempty" bson:"events,omitempty"`
-	EstDelivery string          `json:"est_delivery,omitempty" bson:"est_delivery,omitempty"`
-	Weight      int             `json:"weight" bson:"weight"`
-	Length      int             `json:"length" bson:"length"`
-	Width       int             `json:"width" bson:"width"`
-	Height      int             `json:"height" bson:"height"`
-	CreatedAt   time.Time       `json:"created_at" bson:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at" bson:"updated_at"`
+	ID                   string          `json:"id" bson:"_id,omitempty"`
+	OrderID              string          `json:"order_id" bson:"order_id"`
+	Provider             string          `json:"provider" bson:"provider"`
+	ShipmentID           string          `json:"shipment_id" bson:"shipment_id"`
+	AWB                  string          `json:"awb,omitempty" bson:"awb,omitempty"`
+	CourierName          string          `json:"courier_name,omitempty" bson:"courier_name,omitempty"`
+	TrackingURL          string          `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
+	LabelURL             string          `json:"label_url,omitempty" bson:"label_url,omitempty"`
+	Status               string          `json:"status" bson:"status"`
+	Events               []TrackingEvent `json:"events,omitempty" bson:"events,omitempty"`
+	EstDelivery          string          `json:"est_delivery,omitempty" bson:"est_delivery,omitempty"`
+	ProviderStatus       string          `json:"provider_status,omitempty" bson:"provider_status,omitempty"`
+	LastTrackingPollAt   *time.Time      `json:"last_tracking_poll_at,omitempty" bson:"last_tracking_poll_at,omitempty"`
+	NextTrackingPollAt   time.Time       `json:"next_tracking_poll_at,omitempty" bson:"next_tracking_poll_at,omitempty"`
+	TrackingPollFailures int             `json:"tracking_poll_failures" bson:"tracking_poll_failures"`
+	TrackingTerminal     bool            `json:"tracking_terminal" bson:"tracking_terminal"`
+	TrackingLeaseUntil   time.Time       `json:"-" bson:"tracking_lease_until,omitempty"`
+	Weight               int             `json:"weight" bson:"weight"`
+	Length               int             `json:"length" bson:"length"`
+	Width                int             `json:"width" bson:"width"`
+	Height               int             `json:"height" bson:"height"`
+	CreatedAt            time.Time       `json:"created_at" bson:"created_at"`
+	UpdatedAt            time.Time       `json:"updated_at" bson:"updated_at"`
 }
 
 type TrackingEvent struct {

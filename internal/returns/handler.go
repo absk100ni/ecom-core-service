@@ -141,6 +141,10 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 
 	if _, err := h.db.Collection("return_requests").InsertOne(ctx, returnReq); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "An open return request already exists for this order", "code": errcodes.ERtnDuplicate.Code})
+			return
+		}
 		log.Error("Create", "Failed to insert return request", "order_id", orderID, "err", err.Error())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create return request", "code": errcodes.ERtnCreateFailed.Code})
 		return

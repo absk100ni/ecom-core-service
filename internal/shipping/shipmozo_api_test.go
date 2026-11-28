@@ -77,8 +77,8 @@ func TestShipmozoCreateShipment_TwoStepFlow(t *testing.T) {
 	if pushBody["consignee_name"] != "Ravi" || pushBody["consignee_pin_code"] != "400002" {
 		t.Errorf("consignee fields wrong: %v", pushBody)
 	}
-	if pushBody["cod_amount"].(float64) != 1199.20 {
-		t.Errorf("cod_amount = %v, want rupees 1199.20", pushBody["cod_amount"])
+	if pushBody["cod_amount"] != "1199.20" {
+		t.Errorf("cod_amount = %v, want string 1199.20", pushBody["cod_amount"])
 	}
 	if pushBody["weight"].(float64) != 500 {
 		t.Errorf("weight = %v, want 500 grams", pushBody["weight"])
@@ -119,9 +119,9 @@ func TestShipmozoServiceability_RequestShape(t *testing.T) {
 		w.Write([]byte(`{"result":"1","message":"Success","data":[{"name":"BlueDart Air","total_charges":55.46}]}`))
 	}))
 	defer srv.Close()
-	_, ok, err := testProvider(srv.URL).CheckServiceability(context.Background(), "110001", 0)
-	if err != nil || !ok {
-		t.Fatalf("serviceability: ok=%v err=%v", ok, err)
+	quote, err := testProvider(srv.URL).CheckServiceability(context.Background(), RateRequest{DeliveryPincode: "110001", PaymentType: "PREPAID", OrderAmountPaise: 50000, WeightGrams: 500, LengthCM: 10, WidthCM: 10, HeightCM: 10})
+	if err != nil || !quote.Serviceable {
+		t.Fatalf("serviceability: quote=%+v err=%v", quote, err)
 	}
 	if body["pickup_pincode"] != "400001" || body["delivery_pincode"] != "110001" {
 		t.Errorf("body = %v", body)
@@ -139,11 +139,11 @@ func TestShipmozoServiceability_NoCouriersMeansNotServiceable(t *testing.T) {
 		w.Write([]byte(`{"result":"1","message":"Success","data":[]}`))
 	}))
 	defer srv.Close()
-	_, ok, err := testProvider(srv.URL).CheckServiceability(context.Background(), "999999", 0)
+	quote, err := testProvider(srv.URL).CheckServiceability(context.Background(), RateRequest{DeliveryPincode: "999999", PaymentType: "PREPAID"})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if ok {
+	if quote.Serviceable {
 		t.Error("empty courier list must mean not serviceable")
 	}
 }
@@ -153,15 +153,18 @@ func TestShipmozoTrack_QueryParam(t *testing.T) {
 		if r.URL.Path != "/track-order" || r.URL.Query().Get("awb_number") != "AWB9" {
 			t.Errorf("unexpected %s %s", r.URL.Path, r.URL.RawQuery)
 		}
-		w.Write([]byte(`{"data":{"scan_history":[{"status":"in_transit","remark":"Left origin hub","date":"2026-08-30 10:00:00"}]}}`))
+		w.Write([]byte(`{"result":"1","message":"Success","data":{"courier":"Delhivery","expected_delivery_date":"2026-12-01","current_status":"In Transit","status_time":"2026-11-28 10:00:00","scan_detail":[{"status":"In Transit","remark":"Left origin hub","date":"2026-11-28 10:00:00"}]}}`))
 	}))
 	defer srv.Close()
-	events, err := testProvider(srv.URL).Track(context.Background(), "AWB9")
+	snapshot, err := testProvider(srv.URL).Track(context.Background(), "AWB9")
 	if err != nil {
 		t.Fatalf("track: %v", err)
 	}
-	if len(events) != 1 || events[0].Status != "in_transit" || events[0].Description != "Left origin hub" {
-		t.Errorf("events = %+v", events)
+	if snapshot.CurrentStatus != "In Transit" || snapshot.ExpectedDeliveryDate != "2026-12-01" || snapshot.Courier != "Delhivery" {
+		t.Errorf("snapshot header fields = %+v", snapshot)
+	}
+	if len(snapshot.Events) != 1 || snapshot.Events[0].Status != "In Transit" || snapshot.Events[0].Description != "Left origin hub" {
+		t.Errorf("snapshot = %+v", snapshot)
 	}
 }
 

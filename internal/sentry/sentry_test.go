@@ -57,10 +57,10 @@ func TestParseDSN_Empty_DisablesClient(t *testing.T) {
 	}
 }
 
-func TestNew_NonProduction_DisablesClient(t *testing.T) {
+func TestNew_NonProduction_EnablesWhenConfigured(t *testing.T) {
 	c := New("https://key@sentry.io/123", "development")
-	if c.Enabled() {
-		t.Error("client should be disabled in non-production environment")
+	if !c.Enabled() {
+		t.Error("client should be enabled when a DSN is explicitly configured")
 	}
 }
 
