@@ -66,33 +66,33 @@ func TestMockProviderServiceability(t *testing.T) {
 		{"900001", false}, // starts with 9 — not serviceable
 	}
 	for _, tt := range tests {
-		_, ok, err := p.CheckServiceability(context.Background(), tt.pincode, 0)
+		quote, err := p.CheckServiceability(context.Background(), RateRequest{DeliveryPincode: tt.pincode})
 		if err != nil {
 			t.Fatalf("pincode %s: unexpected error: %v", tt.pincode, err)
 		}
-		if ok != tt.serviceable {
-			t.Errorf("pincode %s: serviceable got %v, want %v", tt.pincode, ok, tt.serviceable)
+		if quote.Serviceable != tt.serviceable {
+			t.Errorf("pincode %s: serviceable got %v, want %v", tt.pincode, quote.Serviceable, tt.serviceable)
 		}
 	}
 }
 
 func TestMockProviderTrack(t *testing.T) {
 	p := NewMockProvider()
-	events, err := p.Track(context.Background(), "AWB123")
+	snapshot, err := p.Track(context.Background(), "AWB123")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events: got %d, want 2", len(events))
+	if len(snapshot.Events) != 2 {
+		t.Fatalf("events: got %d, want 2", len(snapshot.Events))
 	}
-	if events[0].Status != "picked_up" {
-		t.Errorf("first event status: got %q, want %q", events[0].Status, "picked_up")
+	if snapshot.Events[0].Status != "picked_up" {
+		t.Errorf("first event status: got %q, want %q", snapshot.Events[0].Status, "picked_up")
 	}
 }
 
 func TestProductionServiceabilityRequiresProvider(t *testing.T) {
 	handler := &Handler{cfg: &config.Config{Environment: "production"}}
-	serviceable, err := handler.IsServiceable(context.Background(), "121003", 0)
+	serviceable, err := handler.IsServiceable(context.Background(), &models.Order{ShippingAddress: models.Address{Pincode: "121003"}})
 	if err == nil {
 		t.Fatal("expected a configuration error when production courier credentials are absent")
 	}

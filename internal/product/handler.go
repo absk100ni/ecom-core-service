@@ -317,6 +317,7 @@ func (h *Handler) Create(c *gin.Context) {
 		product.SKU = generateSKU(product.Category, product.Name)
 	}
 	product.IsActive = true
+	product.Version = 1
 	product.CreatedAt = time.Now()
 	product.UpdatedAt = time.Now()
 	if product.Images == nil {
@@ -373,6 +374,11 @@ func (h *Handler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid data"})
 		return
 	}
+	expectedVersion := 0
+	if raw, ok := updates["version"].(float64); ok {
+		expectedVersion = int(raw)
+	}
+	delete(updates, "version")
 	updates["updated_at"] = time.Now()
 	delete(updates, "_id")
 	delete(updates, "id")
@@ -460,9 +466,14 @@ func (h *Handler) Update(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.Collection("products").UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": updates})
-	if err != nil || result.MatchedCount == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Product not found"})
+	versionFilter := bson.M{"_id": id, "$or": []bson.M{{"version": expectedVersion}, {"version": bson.M{"$exists": false}}}}
+	result, err := h.db.Collection("products").UpdateOne(ctx, versionFilter, bson.M{"$set": updates, "$inc": bson.M{"version": 1}})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Product update failed"})
+		return
+	}
+	if result.MatchedCount == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Product changed concurrently. Refresh and review the latest values."})
 		return
 	}
 	h.invalidateProductCache(ctx)

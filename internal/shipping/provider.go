@@ -31,9 +31,39 @@ var plog = logger.New("SHIPPING", "PROVIDER")
 
 // CourierProvider abstracts courier operations behind a testable interface.
 type CourierProvider interface {
-	CheckServiceability(ctx context.Context, pincode string, codAmountPaise int) (models.TrackingEvent, bool, error)
+	CheckServiceability(ctx context.Context, req RateRequest) (ServiceabilityQuote, error)
+	PushOrder(ctx context.Context, req ShipmentRequest) (ShipmentResult, error)
 	CreateShipment(ctx context.Context, req ShipmentRequest) (ShipmentResult, error)
-	Track(ctx context.Context, awb string) ([]models.TrackingEvent, error)
+	Track(ctx context.Context, awb string) (TrackingSnapshot, error)
+}
+
+type RateRequest struct {
+	DeliveryPincode  string
+	PaymentType      string
+	OrderAmountPaise int
+	CODAmountPaise   int
+	WeightGrams      int
+	LengthCM         int
+	WidthCM          int
+	HeightCM         int
+}
+
+type ServiceabilityQuote struct {
+	Serviceable   bool
+	CODAvailable  bool
+	EstimatedDays int
+	CourierID     string
+	CourierName   string
+	TotalCharges  float64
+	AutoPickup    bool
+}
+
+type TrackingSnapshot struct {
+	CurrentStatus        string
+	StatusTime           time.Time
+	ExpectedDeliveryDate string
+	Courier              string
+	Events               []models.TrackingEvent
 }
 
 // ShipmentRequest contains everything needed to push an order to a courier.
@@ -55,10 +85,11 @@ type ShipmentRequest struct {
 
 // ShipmentResult is the response from creating a shipment.
 type ShipmentResult struct {
-	AWB         string
-	CourierName string
-	TrackingURL string
-	LabelURL    string
+	ProviderOrderID string
+	AWB             string
+	CourierName     string
+	TrackingURL     string
+	LabelURL        string
 }
 
 // ==================== SHIPMOZO PROVIDER (Shipping API v1) ====================
@@ -93,6 +124,7 @@ func (p *shipmozoProvider) doRequest(ctx context.Context, method, path string, b
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; LucubraElec/1.0; +https://lucubraelec.in)")
 	req.Header.Set("public-key", p.publicKey)
 	req.Header.Set("private-key", p.privateKey)
 
@@ -176,42 +208,76 @@ func extractString(data []byte, keys ...string) string {
 // {"serviceable":false} for lanes where /rate-calculator simultaneously returns real
 // courier rates (e.g. Faridabad→Delhi, BlueDart ₹41). The rate calculator is the
 // trustworthy signal and matches what booking will actually do.
-func (p *shipmozoProvider) CheckServiceability(ctx context.Context, pincode string, codAmountPaise int) (models.TrackingEvent, bool, error) {
-	paymentType := "PREPAID"
-	orderAmount := "500"
-	if codAmountPaise > 0 {
-		paymentType = "COD"
-		orderAmount = fmt.Sprintf("%d", (codAmountPaise+99)/100) // paise -> rupees, ceil
+func (p *shipmozoProvider) CheckServiceability(ctx context.Context, req RateRequest) (ServiceabilityQuote, error) {
+	paymentType := req.PaymentType
+	if paymentType == "" {
+		paymentType = "PREPAID"
+	}
+	weight := req.WeightGrams
+	if weight <= 0 {
+		weight = 500
+	}
+	length, width, height := req.LengthCM, req.WidthCM, req.HeightCM
+	if length <= 0 {
+		length = 10
+	}
+	if width <= 0 {
+		width = 10
+	}
+	if height <= 0 {
+		height = 10
+	}
+	orderAmount := req.OrderAmountPaise
+	if orderAmount <= 0 {
+		orderAmount = 50000
 	}
 	payload := map[string]interface{}{
-		"pickup_pincode":   p.pickupPincode,
-		"delivery_pincode": pincode,
-		"payment_type":     paymentType,
-		"order_amount":     orderAmount,
-		"weight":           "500", // grams; representative default for a quote
-		"dimensions": []map[string]interface{}{
-			{"no_of_box": "1", "length": "10", "width": "10", "height": "10"},
-		},
-		"type_of_package": "SPS",
-		"rate_type":       "FORWARD",
-		"shipment_type":   "FORWARD",
+		"order_id": "", "pickup_pincode": p.pickupPincode, "delivery_pincode": req.DeliveryPincode,
+		"payment_type": paymentType, "order_amount": fmt.Sprintf("%.2f", float64(orderAmount)/100),
+		"weight": fmt.Sprintf("%d", weight), "dimensions": []map[string]interface{}{{"no_of_box": "1", "length": fmt.Sprintf("%d", length), "width": fmt.Sprintf("%d", width), "height": fmt.Sprintf("%d", height)}},
+		"type_of_package": "SPS", "rov_type": "ROV_OWNER", "rate_type": "FORWARD", "shipment_type": "FORWARD",
+	}
+	if paymentType == "COD" {
+		payload["cod_amount"] = fmt.Sprintf("%.2f", float64(req.CODAmountPaise)/100)
+	} else {
+		payload["cod_amount"] = ""
 	}
 	data, err := p.doRequest(ctx, "POST", "/rate-calculator", payload)
 	if err != nil {
-		return models.TrackingEvent{}, false, err
+		return ServiceabilityQuote{}, err
 	}
 	if err := envelopeError(data); err != nil {
-		return models.TrackingEvent{}, false, err
+		return ServiceabilityQuote{}, err
 	}
 	var root struct {
-		Data []map[string]interface{} `json:"data"`
+		Data []struct {
+			ID        interface{} `json:"id"`
+			Name      string      `json:"name"`
+			Estimated string      `json:"estimated_delivery"`
+			Total     float64     `json:"total_charges"`
+			Auto      string      `json:"pickups_automatically_scheduled"`
+		} `json:"data"`
 	}
-	json.Unmarshal(data, &root)
-	return models.TrackingEvent{}, len(root.Data) > 0, nil
+	if err := json.Unmarshal(data, &root); err != nil {
+		return ServiceabilityQuote{}, err
+	}
+	if len(root.Data) == 0 {
+		return ServiceabilityQuote{Serviceable: false}, nil
+	}
+	best := root.Data[0]
+	bestDays := atoiSafe(best.Estimated)
+	for _, rate := range root.Data[1:] {
+		days := atoiSafe(rate.Estimated)
+		if days > 0 && (bestDays == 0 || days < bestDays || (days == bestDays && rate.Total < best.Total)) {
+			best, bestDays = rate, days
+		}
+	}
+	return ServiceabilityQuote{Serviceable: true, CODAvailable: paymentType == "COD", EstimatedDays: bestDays, CourierID: fmt.Sprint(best.ID), CourierName: best.Name, TotalCharges: best.Total, AutoPickup: strings.EqualFold(best.Auto, "YES")}, nil
 }
 
-// CreateShipment — two-step: POST /push-order then POST /auto-assign-order.
-func (p *shipmozoProvider) CreateShipment(ctx context.Context, req ShipmentRequest) (ShipmentResult, error) {
+// PushOrder creates an unassigned order in Shipmozo. It does not book a
+// courier, create an AWB, charge shipping, or schedule pickup.
+func (p *shipmozoProvider) PushOrder(ctx context.Context, req ShipmentRequest) (ShipmentResult, error) {
 	items := make([]map[string]interface{}, 0, len(req.Items))
 	for _, it := range req.Items {
 		items = append(items, map[string]interface{}{
@@ -223,6 +289,10 @@ func (p *shipmozoProvider) CreateShipment(ctx context.Context, req ShipmentReque
 		})
 	}
 
+	codAmount := ""
+	if req.PaymentType == "COD" && req.CODAmountPaise > 0 {
+		codAmount = fmt.Sprintf("%.2f", float64(req.CODAmountPaise)/100)
+	}
 	pushPayload := map[string]interface{}{
 		"order_id":                   req.OrderNumber,
 		"order_date":                 req.OrderDate.Format("2006-01-02"),
@@ -236,7 +306,7 @@ func (p *shipmozoProvider) CreateShipment(ctx context.Context, req ShipmentReque
 		"consignee_state":            req.Address.State,
 		"product_detail":             items,
 		"payment_type":               req.PaymentType,
-		"cod_amount":                 float64(req.CODAmountPaise) / 100.0,
+		"cod_amount":                 codAmount,
 		"shipping_charges":           0,
 		"weight":                     req.WeightGrams, // spec: weight in GRAM
 		"length":                     req.LengthCM,
@@ -261,78 +331,103 @@ func (p *shipmozoProvider) CreateShipment(ctx context.Context, req ShipmentReque
 		providerOrderID = req.OrderNumber
 	}
 
-	assignResp, err := p.doRequest(ctx, "POST", "/auto-assign-order", map[string]interface{}{
-		"order_id": providerOrderID,
-	})
+	return ShipmentResult{ProviderOrderID: providerOrderID}, nil
+}
+
+// CreateShipment preserves the future automatic-assignment path, but the admin
+// dashboard currently uses PushOrder only.
+func (p *shipmozoProvider) CreateShipment(ctx context.Context, req ShipmentRequest) (ShipmentResult, error) {
+	pushed, err := p.PushOrder(ctx, req)
+	if err != nil {
+		return ShipmentResult{}, err
+	}
+	providerOrderID := pushed.ProviderOrderID
+	assignResp, err := p.doRequest(ctx, "POST", "/auto-assign-order", map[string]interface{}{"order_id": providerOrderID})
 	if err != nil {
 		return ShipmentResult{}, fmt.Errorf("auto-assign-order failed (order pushed as %s): %w", providerOrderID, err)
 	}
 	if envErr := envelopeError(assignResp); envErr != nil {
 		return ShipmentResult{}, fmt.Errorf("auto-assign-order (order pushed as %s): %w", providerOrderID, envErr)
 	}
-
 	awb := extractString(assignResp, "awb_number", "awb", "waybill")
 	if awb == "" {
-		// Some flows return AWB on the push response instead.
-		awb = extractString(pushResp, "awb_number", "awb", "waybill")
+		return ShipmentResult{}, fmt.Errorf("no AWB in shipmozo response (order pushed as %s)", providerOrderID)
 	}
-	if awb == "" {
-		return ShipmentResult{}, fmt.Errorf("no AWB in shipmozo response (order pushed as %s) — check raw response in debug logs", providerOrderID)
-	}
-
-	result := ShipmentResult{
-		AWB:         awb,
-		CourierName: extractString(assignResp, "courier_name", "courier", "courier_partner"),
-		TrackingURL: extractString(assignResp, "tracking_url", "track_url"),
-		LabelURL:    extractString(assignResp, "label_url", "label"),
-	}
+	result := ShipmentResult{ProviderOrderID: providerOrderID, AWB: awb, CourierName: extractString(assignResp, "courier_name", "courier", "courier_partner"), TrackingURL: extractString(assignResp, "tracking_url", "track_url"), LabelURL: extractString(assignResp, "label_url", "label")}
 	if result.LabelURL == "" {
-		// Spec: GET /get-order-label/{awb_number} serves the label.
 		result.LabelURL = p.baseURL + "/get-order-label/" + url.PathEscape(awb)
 	}
 	return result, nil
 }
 
 // Track — GET /track-order?awb_number=...
-func (p *shipmozoProvider) Track(ctx context.Context, awb string) ([]models.TrackingEvent, error) {
+func (p *shipmozoProvider) Track(ctx context.Context, awb string) (TrackingSnapshot, error) {
 	data, err := p.doRequest(ctx, "GET", "/track-order?awb_number="+url.QueryEscape(awb), nil)
 	if err != nil {
-		return nil, err
+		return TrackingSnapshot{}, err
 	}
-	// Undocumented response shape: try the common containers.
+	if err := envelopeError(data); err != nil {
+		return TrackingSnapshot{}, err
+	}
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
-		return []models.TrackingEvent{}, nil
+		return TrackingSnapshot{}, err
 	}
-	rawEvents := findEventArray(root)
-	events := make([]models.TrackingEvent, 0, len(rawEvents))
-	for _, re := range rawEvents {
-		em, ok := re.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		ev := models.TrackingEvent{
-			Status:      strAt(em, "status", "current_status", "scan_status"),
-			Description: strAt(em, "description", "remark", "activity", "message"),
-		}
-		for _, tk := range []string{"timestamp", "date", "scan_date", "updated_at"} {
-			if ts, ok := em[tk].(string); ok {
-				for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
-					if t, err := time.Parse(layout, ts); err == nil {
-						ev.Timestamp = t
-						break
-					}
-				}
+	container := root
+	if inner, ok := root["data"].(map[string]interface{}); ok {
+		container = inner
+	}
+	snapshot := TrackingSnapshot{
+		CurrentStatus:        strAt(container, "current_status", "status"),
+		ExpectedDeliveryDate: strAt(container, "expected_delivery_date", "estimated_delivery_date"),
+		Courier:              strAt(container, "courier", "courier_name", "courier_company"),
+	}
+	for _, key := range []string{"status_time", "updated_at"} {
+		if raw, ok := container[key].(string); ok {
+			snapshot.StatusTime = parseProviderTime(raw)
+			if !snapshot.StatusTime.IsZero() {
 				break
 			}
 		}
-		events = append(events, ev)
 	}
-	return events, nil
+	rawEvents := findEventArray(root)
+	for _, raw := range rawEvents {
+		eventMap, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		event := models.TrackingEvent{Status: strAt(eventMap, "status", "current_status", "scan_status"), Description: strAt(eventMap, "description", "remark", "activity", "message")}
+		for _, key := range []string{"timestamp", "date", "scan_date", "status_time", "updated_at"} {
+			if value, ok := eventMap[key].(string); ok {
+				event.Timestamp = parseProviderTime(value)
+				if !event.Timestamp.IsZero() {
+					break
+				}
+			}
+		}
+		snapshot.Events = append(snapshot.Events, event)
+	}
+	if len(snapshot.Events) == 0 && snapshot.CurrentStatus != "" {
+		snapshot.Events = append(snapshot.Events, models.TrackingEvent{Status: snapshot.CurrentStatus, Description: snapshot.CurrentStatus, Timestamp: snapshot.StatusTime})
+	}
+	if snapshot.CurrentStatus == "" && len(snapshot.Events) > 0 {
+		snapshot.CurrentStatus = snapshot.Events[len(snapshot.Events)-1].Status
+		snapshot.StatusTime = snapshot.Events[len(snapshot.Events)-1].Timestamp
+	}
+	return snapshot, nil
+}
+
+func parseProviderTime(value string) time.Time {
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
 }
 
 func findEventArray(root map[string]interface{}) []interface{} {
-	for _, k := range []string{"events", "scan_history", "tracking_data", "history", "scans"} {
+	for _, k := range []string{"events", "scan_detail", "scan_history", "tracking_data", "history", "scans"} {
 		if arr, ok := root[k].([]interface{}); ok {
 			return arr
 		}
@@ -362,11 +457,15 @@ type mockProvider struct{}
 // NewMockProvider creates a deterministic mock courier provider for development.
 func NewMockProvider() CourierProvider { return &mockProvider{} }
 
-func (p *mockProvider) CheckServiceability(_ context.Context, pincode string, _ int) (models.TrackingEvent, bool, error) {
-	if len(pincode) > 0 && pincode[0] >= '8' {
-		return models.TrackingEvent{}, false, nil
+func (p *mockProvider) CheckServiceability(_ context.Context, req RateRequest) (ServiceabilityQuote, error) {
+	if len(req.DeliveryPincode) > 0 && req.DeliveryPincode[0] >= '8' {
+		return ServiceabilityQuote{Serviceable: false}, nil
 	}
-	return models.TrackingEvent{}, true, nil
+	return ServiceabilityQuote{Serviceable: true, CODAvailable: req.PaymentType == "COD", EstimatedDays: 3, CourierName: "Mock Express"}, nil
+}
+
+func (p *mockProvider) PushOrder(_ context.Context, req ShipmentRequest) (ShipmentResult, error) {
+	return ShipmentResult{ProviderOrderID: "mock-" + req.OrderNumber}, nil
 }
 
 func (p *mockProvider) CreateShipment(_ context.Context, req ShipmentRequest) (ShipmentResult, error) {
@@ -379,11 +478,12 @@ func (p *mockProvider) CreateShipment(_ context.Context, req ShipmentRequest) (S
 	}, nil
 }
 
-func (p *mockProvider) Track(_ context.Context, awb string) ([]models.TrackingEvent, error) {
-	return []models.TrackingEvent{
+func (p *mockProvider) Track(_ context.Context, awb string) (TrackingSnapshot, error) {
+	events := []models.TrackingEvent{
 		{Status: "picked_up", Description: "Shipment picked up from warehouse", Timestamp: time.Now().Add(-48 * time.Hour)},
 		{Status: "in_transit", Description: "In transit to destination hub", Timestamp: time.Now().Add(-24 * time.Hour)},
-	}, nil
+	}
+	return TrackingSnapshot{CurrentStatus: "in_transit", StatusTime: events[1].Timestamp, Courier: "Mock Express", Events: events}, nil
 }
 
 // ProviderFromConfig returns the appropriate courier provider based on config.

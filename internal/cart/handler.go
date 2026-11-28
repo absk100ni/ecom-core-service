@@ -110,7 +110,8 @@ func (h *Handler) Get(c *gin.Context) {
 	}
 
 	if len(refreshedItems) > 0 {
-		h.db.Collection("carts").UpdateOne(ctx, bson.M{"_id": cart.ID}, bson.M{"$set": bson.M{"items": refreshedItems, "updated_at": time.Now()}})
+		filter := bson.M{"_id": cart.ID, "$or": []bson.M{{"version": cart.Version}, {"version": bson.M{"$exists": false}}}}
+		h.db.Collection("carts").UpdateOne(ctx, filter, bson.M{"$set": bson.M{"items": refreshedItems, "updated_at": time.Now()}, "$inc": bson.M{"version": 1}})
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -185,7 +186,7 @@ func (h *Handler) AddItem(c *gin.Context) {
 	var cart models.Cart
 	err := h.db.Collection("carts").FindOne(ctx, bson.M{"user_id": userID}).Decode(&cart)
 	if err != nil {
-		cart = models.Cart{ID: uuid.New().String(), UserID: userID, Items: []models.CartItem{item}, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+		cart = models.Cart{ID: uuid.New().String(), UserID: userID, Items: []models.CartItem{item}, CreatedAt: time.Now(), UpdatedAt: time.Now(), Version: 1}
 		h.db.Collection("carts").InsertOne(ctx, cart)
 	} else {
 		found := false
@@ -214,7 +215,12 @@ func (h *Handler) AddItem(c *gin.Context) {
 		if !found {
 			cart.Items = append(cart.Items, item)
 		}
-		h.db.Collection("carts").UpdateOne(ctx, bson.M{"_id": cart.ID}, bson.M{"$set": bson.M{"items": cart.Items, "updated_at": time.Now()}})
+		versionFilter := bson.M{"_id": cart.ID, "$or": []bson.M{{"version": cart.Version}, {"version": bson.M{"$exists": false}}}}
+		result, updateErr := h.db.Collection("carts").UpdateOne(ctx, versionFilter, bson.M{"$set": bson.M{"items": cart.Items, "updated_at": time.Now()}, "$inc": bson.M{"version": 1}})
+		if updateErr != nil || result.MatchedCount == 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Cart changed concurrently. Refresh and retry."})
+			return
+		}
 	}
 
 	log.Info("ADD", "Item added to cart", "user_id", userID, "product_id", req.ProductID, "quantity", req.Quantity, "price", price)
@@ -233,7 +239,7 @@ func (h *Handler) RemoveItem(c *gin.Context) {
 	defer cancel()
 
 	h.db.Collection("carts").UpdateOne(ctx, bson.M{"user_id": userID},
-		bson.M{"$pull": bson.M{"items": itemFilter}, "$set": bson.M{"updated_at": time.Now()}})
+		bson.M{"$pull": bson.M{"items": itemFilter}, "$set": bson.M{"updated_at": time.Now()}, "$inc": bson.M{"version": 1}})
 
 	log.Info("REMOVE", "Item removed from cart", "user_id", userID, "product_id", productID)
 	c.JSON(http.StatusOK, gin.H{"message": "Item removed"})
@@ -288,7 +294,7 @@ func (h *Handler) UpdateQuantity(c *gin.Context) {
 	}
 	result, err := h.db.Collection("carts").UpdateOne(ctx,
 		bson.M{"user_id": userID},
-		bson.M{"$set": bson.M{"items.$[item].quantity": body.Quantity, "updated_at": time.Now()}},
+		bson.M{"$set": bson.M{"items.$[item].quantity": body.Quantity, "updated_at": time.Now()}, "$inc": bson.M{"version": 1}},
 		options.Update().SetArrayFilters(options.ArrayFilters{Filters: []interface{}{itemFilter}}),
 	)
 	if err != nil || result.ModifiedCount == 0 {

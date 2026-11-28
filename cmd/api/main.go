@@ -172,6 +172,9 @@ func main() {
 	productH := product.NewHandler(db, appCache)
 	cartH := cart.NewHandler(db)
 	orderH := order.NewHandler(db, cfg)
+	if isProduction && !orderH.SupportsTransactions() {
+		log.Fatal("Production checkout requires a MongoDB replica set or sharded cluster with transaction support")
+	}
 	paymentH := payment.NewHandler(db, cfg)
 	shippingH := shipping.NewHandler(db, cfg, appCache)
 	orderH.WithServiceabilityChecker(shippingH)
@@ -200,6 +203,7 @@ func main() {
 	monitorCtx, stopMonitor := context.WithCancel(context.Background())
 	defer stopMonitor()
 	opsService.Start(monitorCtx)
+	shippingH.StartTrackingPoller(monitorCtx)
 
 	checkoutGuard := middleware.RequireCheckoutEnabled(cfg.CheckoutEnabled)
 	api := r.Group("/api/v1")
@@ -320,6 +324,7 @@ func main() {
 		adminGroup.PUT("/order/:id/status", orderH.UpdateStatus)
 		adminGroup.POST("/order/:id/refund", orderH.ProcessRefund) // legacy route
 		adminGroup.POST("/orders/:id/refund", orderH.ProcessRefund)
+		adminGroup.POST("/orders/:id/push-shipmozo", shippingH.PushOrder)
 		adminGroup.POST("/orders/:id/ship", shippingH.CreateShipment)
 		adminGroup.POST("/shipping/create", shippingH.CreateShipment) // legacy route
 
@@ -415,6 +420,7 @@ func ensureIndexes(db *mongo.Database) {
 		{"orders", mongo.IndexModel{Keys: bson.D{{Key: "created_at", Value: -1}}}},
 		{"payments", mongo.IndexModel{Keys: bson.D{{Key: "order_id", Value: 1}}}},
 		{"payments", mongo.IndexModel{Keys: bson.D{{Key: "razorpay_order_id", Value: 1}}}},
+		{"shipments", mongo.IndexModel{Keys: bson.D{{Key: "tracking_terminal", Value: 1}, {Key: "next_tracking_poll_at", Value: 1}}}},
 		{"coupons", mongo.IndexModel{Keys: bson.D{{Key: "code", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"wishlists", mongo.IndexModel{Keys: bson.D{{Key: "user_id", Value: 1}}, Options: options.Index().SetUnique(true)}},
 		{"reviews", mongo.IndexModel{Keys: bson.D{{Key: "product_id", Value: 1}, {Key: "created_at", Value: -1}}}},
@@ -464,6 +470,8 @@ func ensureCriticalIndexes(db *mongo.Database) error {
 		collection string
 		model      mongo.IndexModel
 	}{
+		{"orders", mongo.IndexModel{Keys: bson.D{{Key: "idempotency_key", Value: 1}}, Options: options.Index().SetUnique(true).SetName("order_idempotency_unique").SetPartialFilterExpression(bson.M{"idempotency_key": bson.M{"$type": "string", "$gt": ""}})}},
+		{"return_requests", mongo.IndexModel{Keys: bson.D{{Key: "order_id", Value: 1}}, Options: options.Index().SetUnique(true).SetName("one_open_return_per_order").SetPartialFilterExpression(bson.M{"status": bson.M{"$in": []string{"requested", "approved"}}})}},
 		{"payments", mongo.IndexModel{
 			Keys: bson.D{{Key: "order_id", Value: 1}},
 			Options: options.Index().SetUnique(true).SetName("one_active_payment_per_order").

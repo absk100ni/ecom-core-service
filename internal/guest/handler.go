@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"ecom-core-service/internal/config"
@@ -116,6 +117,9 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 		return
 	}
 
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if idempotencyKey == "" { c.JSON(http.StatusBadRequest, gin.H{"error":"Idempotency-Key header is required"}); return }
+
 	// Validate item count
 	if len(req.Items) == 0 || len(req.Items) > 20 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Items must contain 1-20 products", "code": errcodes.EGstInvalidItems.Code})
@@ -197,7 +201,7 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 	}
 
 	// Place the order using the shared core (same atomic stock reservation)
-	o, stockErr, err := h.orderH.PlaceOrder(ctx, "", cartItems, addr, req.CouponCode, "", paymentPlan, true)
+	o, stockErr, err := h.orderH.PlaceOrder(ctx, "", cartItems, addr, req.CouponCode, "", paymentPlan, true, idempotencyKey)
 	if stockErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Stock check failed", "code": errcodes.EOrdStockFailed.Code, "details": stockErr})
 		return

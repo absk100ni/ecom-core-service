@@ -21,7 +21,7 @@ func ProductionChecks(c *Config) []Check {
 		{Name: "guest_token_secret", Required: true, Ready: c.GuestTokenSecret != "" && c.GuestTokenSecret != "dev-guest-secret" && c.GuestTokenSecret != "dev-secret-key", Detail: "GUEST_TOKEN_SECRET must be non-default"},
 		{Name: "cors", Required: true, Ready: explicitHTTPSOrigins(c.CORSOrigins), Detail: "CORS_ORIGINS must list explicit HTTPS origins"},
 		{Name: "checkout_control", Required: true, Ready: c.CheckoutEnabledSet, Detail: "CHECKOUT_ENABLED must be explicitly configured in production"},
-		{Name: "shipping", Required: true, Ready: c.ShipmozoPublicKey != "" && c.ShipmozoPrivateKey != "" && c.ShipmozoWarehouseID != "" && c.ShippingWebhookToken != "", Detail: "Shipmozo credentials, warehouse and webhook token are required"},
+		{Name: "shipping", Required: true, Ready: c.ShipmozoPublicKey != "" && c.ShipmozoPrivateKey != "" && c.ShipmozoWarehouseID != "", Detail: "Shipmozo credentials and warehouse are required; tracking uses authenticated polling"},
 		{Name: "storage", Required: true, Ready: c.S3Bucket != "" && c.S3Region != "" && c.S3PublicBaseURL != "", Detail: "S3 bucket, region and controlled public CDN origin are required"},
 		{Name: "invoice_identity", Required: true, Ready: c.BusinessLegalName != "" && c.BusinessAddress != "" && c.BusinessGSTIN != "" && c.BusinessState != "" && c.BusinessStateCode != "", Detail: "Business identity and GST fields are required"},
 		{Name: "redis", Required: false, Ready: c.RedisAddr != "", Detail: "Redis is optional; the service falls back to process-local controls"},

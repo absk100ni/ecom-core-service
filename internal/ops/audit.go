@@ -32,21 +32,22 @@ type AuditEvent struct {
 type auditRoute struct{ action, resource, collection string }
 
 var auditRoutes = map[string]auditRoute{
-	"POST /api/v1/admin/products":           {"product.create", "product", "products"},
-	"PUT /api/v1/admin/products/:id":        {"product.update", "product", "products"},
-	"DELETE /api/v1/admin/products/:id":     {"product.delete", "product", "products"},
-	"POST /api/v1/admin/categories":         {"category.create", "category", "categories"},
-	"PUT /api/v1/admin/categories/:id":      {"category.update", "category", "categories"},
-	"DELETE /api/v1/admin/categories/:id":   {"category.delete", "category", "categories"},
-	"PUT /api/v1/admin/order/:id/status":    {"order.status.update", "order", "orders"},
-	"POST /api/v1/admin/order/:id/refund":   {"order.refund", "order", "orders"},
-	"POST /api/v1/admin/orders/:id/refund":  {"order.refund", "order", "orders"},
-	"POST /api/v1/admin/orders/:id/ship":    {"shipment.create", "order", "orders"},
-	"POST /api/v1/admin/coupons":            {"coupon.create", "coupon", "coupons"},
-	"PUT /api/v1/admin/coupons/:id":         {"coupon.update", "coupon", "coupons"},
-	"DELETE /api/v1/admin/coupons/:id":      {"coupon.delete", "coupon", "coupons"},
-	"PUT /api/v1/admin/returns/:id":         {"return.update", "return_request", "return_requests"},
-	"PUT /api/v1/admin/reviews/:id/approve": {"review.publish", "review", "reviews"},
+	"POST /api/v1/admin/products":                 {"product.create", "product", "products"},
+	"PUT /api/v1/admin/products/:id":              {"product.update", "product", "products"},
+	"DELETE /api/v1/admin/products/:id":           {"product.delete", "product", "products"},
+	"POST /api/v1/admin/categories":               {"category.create", "category", "categories"},
+	"PUT /api/v1/admin/categories/:id":            {"category.update", "category", "categories"},
+	"DELETE /api/v1/admin/categories/:id":         {"category.delete", "category", "categories"},
+	"PUT /api/v1/admin/order/:id/status":          {"order.status.update", "order", "orders"},
+	"POST /api/v1/admin/order/:id/refund":         {"order.refund", "order", "orders"},
+	"POST /api/v1/admin/orders/:id/refund":        {"order.refund", "order", "orders"},
+	"POST /api/v1/admin/orders/:id/push-shipmozo": {"shipment.push", "order", "orders"},
+	"POST /api/v1/admin/orders/:id/ship":          {"shipment.create", "order", "orders"},
+	"POST /api/v1/admin/coupons":                  {"coupon.create", "coupon", "coupons"},
+	"PUT /api/v1/admin/coupons/:id":               {"coupon.update", "coupon", "coupons"},
+	"DELETE /api/v1/admin/coupons/:id":            {"coupon.delete", "coupon", "coupons"},
+	"PUT /api/v1/admin/returns/:id":               {"return.update", "return_request", "return_requests"},
+	"PUT /api/v1/admin/reviews/:id/approve":       {"review.publish", "review", "reviews"},
 }
 
 func AuditMiddleware(db *mongo.Database) gin.HandlerFunc {

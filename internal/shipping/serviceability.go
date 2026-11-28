@@ -8,9 +8,11 @@ import (
 	"regexp"
 	"time"
 
+	"ecom-core-service/internal/models"
 	"ecom-core-service/pkg/errcodes"
 
 	"github.com/gin-gonic/gin"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 // Serviceability is the "check delivery by pincode" result shown on the PDP. It answers
@@ -46,7 +48,7 @@ func (h *Handler) CheckServiceability(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	cacheKey := fmt.Sprintf("serviceability:%s:%s", h.cfg.WarehousePincode, pincode)
+	cacheKey := fmt.Sprintf("serviceability:%s:%s:%s:%s:%s", h.cfg.WarehousePincode, pincode, c.Query("product_id"), c.Query("variant_id"), c.DefaultQuery("quantity", "1"))
 
 	// 1. Cache
 	if cached, ok := h.cache.Get(ctx, cacheKey); ok {
@@ -59,8 +61,34 @@ func (h *Handler) CheckServiceability(c *gin.Context) {
 		}
 	}
 
-	// 2. Resolve (Shiprocket when configured, else mock)
-	s := h.resolveServiceability(pincode)
+	// 2. Resolve against actual product package data when supplied.
+	rateReq := RateRequest{DeliveryPincode: pincode, PaymentType: "COD", OrderAmountPaise: 50000, CODAmountPaise: 50000, WeightGrams: 500, LengthCM: 10, WidthCM: 10, HeightCM: 10}
+	if productID := c.Query("product_id"); productID != "" {
+		var product models.Product
+		if err := h.db.Collection("products").FindOne(ctx, bson.M{"_id": productID, "is_active": true}).Decode(&product); err == nil {
+			quantity := 1
+			fmt.Sscanf(c.DefaultQuery("quantity", "1"), "%d", &quantity)
+			if quantity < 1 {
+				quantity = 1
+			}
+			price := product.Price
+			if variantID := c.Query("variant_id"); variantID != "" {
+				for _, variant := range product.Variants {
+					if variant.ID == variantID && variant.Price > 0 {
+						price = variant.Price
+						break
+					}
+				}
+			}
+			rateReq.OrderAmountPaise = price * quantity
+			rateReq.CODAmountPaise = rateReq.OrderAmountPaise
+			rateReq.WeightGrams = product.Weight * quantity
+			rateReq.LengthCM = product.LengthCM
+			rateReq.WidthCM = product.WidthCM
+			rateReq.HeightCM = product.HeightCM * quantity
+		}
+	}
+	s := h.resolveServiceability(rateReq)
 	if s.Source == "unavailable" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Delivery availability could not be confirmed. Please try again.", "code": errcodes.EShipServiceLookupFailed.Code})
 		return
@@ -83,19 +111,15 @@ func (h *Handler) CheckServiceability(c *gin.Context) {
 // resolveServiceability calls Shiprocket if a token is configured, otherwise returns a
 // deterministic mock so local/dev and unconfigured environments still work (mirrors the
 // mock-shipment convention used in CreateShipment).
-func (h *Handler) resolveServiceability(pincode string) Serviceability {
+func (h *Handler) resolveServiceability(req RateRequest) Serviceability {
+	pincode := req.DeliveryPincode
 	// Preferred: the configured courier provider (Shipmozo when keys are set).
 	if h.cfg.ShipmozoPublicKey != "" && h.cfg.ShipmozoPrivateKey != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		if _, ok, err := h.provider.CheckServiceability(ctx, pincode, 100); err == nil {
-			return Serviceability{
-				Pincode:      pincode,
-				Serviceable:  ok,
-				CODAvailable: ok, // Shipmozo's endpoint doesn't split COD; refine if their response includes it
-				EstDays:      3,  // provider response doesn't carry EDD; conservative default
-				Source:       "shipmozo",
-			}
+		quote, err := h.provider.CheckServiceability(ctx, req)
+		if err == nil {
+			return Serviceability{Pincode: pincode, Serviceable: quote.Serviceable, CODAvailable: quote.CODAvailable, EstDays: quote.EstimatedDays, Courier: quote.CourierName, Source: "shipmozo"}
 		} else {
 			log.WarnWithCode("SERVICEABILITY", errcodes.EShipServiceLookupFailed.Code,
 				"Shipmozo lookup failed, falling back", "pincode", pincode, "err", err.Error())
@@ -231,16 +255,34 @@ func atoiSafe(s string) int {
 
 // IsServiceable is the checkout-facing delivery gate. Production never falls
 // back to synthetic availability when the courier cannot verify the lane.
-func (h *Handler) IsServiceable(ctx context.Context, pincode string, codAmountPaise int) (bool, error) {
-	if !pincodeRe.MatchString(pincode) {
+func (h *Handler) IsServiceable(ctx context.Context, order *models.Order) (bool, error) {
+	if order == nil || !pincodeRe.MatchString(order.ShippingAddress.Pincode) {
 		return false, fmt.Errorf("invalid pincode")
 	}
 	if h.cfg.ShipmozoPublicKey != "" && h.cfg.ShipmozoPrivateKey != "" {
-		_, ok, err := h.provider.CheckServiceability(ctx, pincode, codAmountPaise)
-		return ok, err
+		quote, err := h.provider.CheckServiceability(ctx, rateRequestForOrder(order))
+		return quote.Serviceable, err
 	}
 	if h.cfg.Environment == "production" {
 		return false, fmt.Errorf("courier serviceability provider is not configured")
 	}
-	return mockServiceability(pincode).Serviceable, nil
+	return mockServiceability(order.ShippingAddress.Pincode).Serviceable, nil
+}
+
+func rateRequestForOrder(order *models.Order) RateRequest {
+	request := RateRequest{DeliveryPincode: order.ShippingAddress.Pincode, PaymentType: "PREPAID", OrderAmountPaise: order.Total, CODAmountPaise: order.CODAmount}
+	if order.CODAmount > 0 {
+		request.PaymentType = "COD"
+	}
+	for _, item := range order.Items {
+		request.WeightGrams += item.Weight * item.Quantity
+		if item.LengthCM > request.LengthCM {
+			request.LengthCM = item.LengthCM
+		}
+		if item.WidthCM > request.WidthCM {
+			request.WidthCM = item.WidthCM
+		}
+		request.HeightCM += item.HeightCM * item.Quantity
+	}
+	return request
 }

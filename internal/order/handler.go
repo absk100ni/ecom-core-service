@@ -48,7 +48,7 @@ var (
 )
 
 type serviceabilityChecker interface {
-	IsServiceable(ctx context.Context, pincode string, codAmountPaise int) (bool, error)
+	IsServiceable(ctx context.Context, order *models.Order) (bool, error)
 }
 
 type Handler struct {
@@ -62,6 +62,8 @@ type Handler struct {
 func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
 	return &Handler{db: db, cfg: cfg, useTxn: supportsTransactions(db)}
 }
+
+func (h *Handler) SupportsTransactions() bool { return h.useTxn }
 
 // WithNotifier injects the notification service (optional — nil means no notifications).
 func (h *Handler) WithNotifier(n *notify.Notifier) *Handler { h.notifier = n; return h }
@@ -150,7 +152,12 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 
-	order, stockErr, err := h.placeOrder(ctx, userID, cart.Items, req.ShippingAddress, req.CouponCode, req.Notes, paymentPlan, false)
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if idempotencyKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header is required"})
+		return
+	}
+	order, stockErr, err := h.placeOrder(ctx, userID, cart.Items, req.ShippingAddress, req.CouponCode, req.Notes, paymentPlan, false, idempotencyKey)
 	if stockErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Stock check failed", "code": errcodes.EOrdStockFailed.Code, "details": stockErr})
 		return
@@ -183,8 +190,8 @@ func (h *Handler) Create(c *gin.Context) {
 // PlaceOrder is the exported entry point for placing an order. Used by both the authed
 // Create handler and the guest checkout handler. cartItems is the list of items to
 // order. isGuest=true marks the order as a guest order (no user record).
-func (h *Handler) PlaceOrder(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool) (*models.Order, []string, error) {
-	return h.placeOrder(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest)
+func (h *Handler) PlaceOrder(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool, idempotencyKey string) (*models.Order, []string, error) {
+	return h.placeOrder(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest, idempotencyKey)
 }
 
 // placeOrder runs the checkout writes (stock decrement, coupon, order insert, cart clear)
@@ -192,11 +199,23 @@ func (h *Handler) PlaceOrder(ctx context.Context, userID string, cartItems []mod
 // aborts and rolls back everything. On standalone MongoDB it falls back to the original
 // best-effort manual compensating rollback. Returns (order, stockDetails, err): stockDetails
 // is non-nil only for an out-of-stock condition (client 400), err for any other failure.
-func (h *Handler) placeOrder(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool) (*models.Order, []string, error) {
-	if h.useTxn {
-		return h.placeOrderTxn(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest)
+func (h *Handler) placeOrder(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool, idempotencyKey string) (*models.Order, []string, error) {
+	var existing models.Order
+	if idempotencyKey != "" && h.db.Collection("orders").FindOne(ctx, bson.M{"idempotency_key": idempotencyKey}).Decode(&existing) == nil {
+		return &existing, nil, nil
 	}
-	return h.placeOrderManual(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest)
+	var created *models.Order
+	var stock []string
+	var err error
+	if h.useTxn {
+		created, stock, err = h.placeOrderTxn(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest, idempotencyKey)
+	} else {
+		created, stock, err = h.placeOrderManual(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest, idempotencyKey)
+	}
+	if err != nil && idempotencyKey != "" && h.db.Collection("orders").FindOne(ctx, bson.M{"idempotency_key": idempotencyKey}).Decode(&existing) == nil {
+		return &existing, nil, nil
+	}
+	return created, stock, err
 }
 
 // buildOrder performs the stock decrements and assembles the order. It returns the order,
@@ -207,7 +226,7 @@ func (h *Handler) placeOrder(ctx context.Context, userID string, cartItems []mod
 // cartItems is the list of items to place — from the server cart (authed) or from the
 // request body (guest). The isGuest flag marks the order so downstream code (e.g.
 // markPaymentPaid) knows not to look for a user record or server cart.
-func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool) (order *models.Order, decremented []models.OrderItem, stockDetails []string, err error) {
+func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool, idempotencyKey string) (order *models.Order, decremented []models.OrderItem, stockDetails []string, err error) {
 	items := make([]models.OrderItem, 0, len(cartItems))
 	subtotal := 0
 	maxAdvancePercent := 0
@@ -347,7 +366,7 @@ func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []mod
 	}
 
 	order = &models.Order{
-		ID: uuid.New().String(), UserID: userID, OrderNumber: genOrderNumber(),
+		ID: uuid.New().String(), UserID: userID, OrderNumber: genOrderNumber(), IdempotencyKey: idempotencyKey,
 		Items: items, Subtotal: subtotal, ShippingCost: shippingCost, Discount: discount,
 		Total: total, PaymentPlan: paymentPlan, AdvanceAmount: advanceAmount, CODAmount: codAmount,
 		CouponCode: couponCode, CouponUsed: couponUsed, Status: "placed", PaymentStatus: "pending",
@@ -359,7 +378,7 @@ func (h *Handler) buildOrder(ctx context.Context, userID string, cartItems []mod
 
 // placeOrderTxn runs the whole checkout inside a multi-document transaction. Any error
 // returned from the callback aborts the transaction, atomically rolling back every write.
-func (h *Handler) placeOrderTxn(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool) (*models.Order, []string, error) {
+func (h *Handler) placeOrderTxn(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool, idempotencyKey string) (*models.Order, []string, error) {
 	session, err := h.db.Client().StartSession()
 	if err != nil {
 		return nil, nil, fmt.Errorf("start session: %w", err)
@@ -374,7 +393,7 @@ func (h *Handler) placeOrderTxn(ctx context.Context, userID string, cartItems []
 	errStockAbort := fmt.Errorf("stock unavailable")
 
 	_, txnErr := session.WithTransaction(ctx, func(sessCtx mongo.SessionContext) (interface{}, error) {
-		o, _, details, bErr := h.buildOrder(sessCtx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest)
+		o, _, details, bErr := h.buildOrder(sessCtx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest, idempotencyKey)
 		if bErr != nil {
 			return nil, bErr
 		}
@@ -383,7 +402,7 @@ func (h *Handler) placeOrderTxn(ctx context.Context, userID string, cartItems []
 			return nil, errStockAbort
 		}
 		if h.shipping != nil {
-			serviceable, serviceErr := h.shipping.IsServiceable(sessCtx, o.ShippingAddress.Pincode, o.CODAmount)
+			serviceable, serviceErr := h.shipping.IsServiceable(sessCtx, o)
 			if serviceErr != nil {
 				return nil, fmt.Errorf("%w: %v", ErrDeliveryCheckFailed, serviceErr)
 			}
@@ -412,8 +431,8 @@ func (h *Handler) placeOrderTxn(ctx context.Context, userID string, cartItems []
 
 // placeOrderManual is the standalone-MongoDB fallback: it performs the same writes without
 // a transaction and compensates by restoring stock if the order insert fails.
-func (h *Handler) placeOrderManual(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool) (*models.Order, []string, error) {
-	order, decremented, stockDetails, err := h.buildOrder(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest)
+func (h *Handler) placeOrderManual(ctx context.Context, userID string, cartItems []models.CartItem, addr models.Address, couponCode, notes, paymentPlan string, isGuest bool, idempotencyKey string) (*models.Order, []string, error) {
+	order, decremented, stockDetails, err := h.buildOrder(ctx, userID, cartItems, addr, couponCode, notes, paymentPlan, isGuest, idempotencyKey)
 	if err != nil {
 		h.restoreStock(ctx, decremented) // some items may already be decremented
 		return nil, nil, err
@@ -425,7 +444,7 @@ func (h *Handler) placeOrderManual(ctx context.Context, userID string, cartItems
 	}
 
 	if h.shipping != nil {
-		serviceable, serviceErr := h.shipping.IsServiceable(ctx, order.ShippingAddress.Pincode, order.CODAmount)
+		serviceable, serviceErr := h.shipping.IsServiceable(ctx, order)
 		if serviceErr != nil || !serviceable {
 			h.restoreStock(ctx, decremented)
 			if order.CouponUsed {
@@ -910,7 +929,11 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		return
 	}
 	if refundErr != nil {
-		log.Error("REFUND", "Gateway refund failed", "order_id", id, "err", refundErr.Error())
+		// A timeout can mean the provider accepted the refund but the response was
+		// lost. Keep the claim locked until provider reconciliation.
+		providerConfirmed = true
+		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": id}, bson.M{"$set": bson.M{"refund_reconciliation_required": true, "refund_reconciliation_error": refundErr.Error(), "updated_at": time.Now()}})
+		log.Error("REFUND", "Gateway refund failed or timed out; reconciliation required", "order_id", id, "err", refundErr.Error())
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Payment provider did not confirm the refund", "code": errcodes.EOrdRefundFailed.Code})
 		return
 	}
