@@ -20,6 +20,7 @@ import (
 	"ecom-core-service/internal/config"
 	"ecom-core-service/internal/contact"
 	"ecom-core-service/internal/coupon"
+	"ecom-core-service/internal/featureflags"
 	"ecom-core-service/internal/guest"
 	"ecom-core-service/internal/invoice"
 	"ecom-core-service/internal/middleware"
@@ -205,10 +206,15 @@ func main() {
 	opsService.Start(monitorCtx)
 	shippingH.StartTrackingPoller(monitorCtx)
 
+	featureFlagService := featureflags.New(db)
+	if err := featureFlagService.Seed(context.Background()); err != nil {
+		log.Fatalf("Feature flag seed failed: %v", err)
+	}
 	checkoutGuard := middleware.RequireCheckoutEnabled(cfg.CheckoutEnabled)
 	api := r.Group("/api/v1")
 	{
 		// ==================== PUBLIC ====================
+		api.GET("/feature-flags", featureFlagService.Public)
 		api.GET("/checkout/status", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"enabled": cfg.CheckoutEnabled})
 		})
@@ -234,8 +240,8 @@ func main() {
 		guestGroup := api.Group("/guest")
 		guestGroup.Use(middleware.RateLimitMiddleware(appCache, 20, time.Minute))
 		{
-			guestGroup.POST("/orders", checkoutGuard, guestH.CreateOrder)
-			guestGroup.POST("/payment/create", checkoutGuard, guestH.CreatePayment)
+			guestGroup.POST("/orders", featureFlagService.BlockDuringMaintenance, checkoutGuard, guestH.CreateOrder)
+			guestGroup.POST("/payment/create", featureFlagService.BlockDuringMaintenance, checkoutGuard, guestH.CreatePayment)
 			guestGroup.POST("/payment/verify", guestH.VerifyPayment)
 			guestGroup.POST("/orders/:id/abandon", guestH.Abandon)
 			guestGroup.GET("/orders/track", guestH.Track)
@@ -252,7 +258,7 @@ func main() {
 		protected.PUT("/cart/item/:productId", cartH.UpdateQuantity)
 		protected.DELETE("/cart", cartH.Clear)
 
-		protected.POST("/orders", checkoutGuard, orderH.Create)
+		protected.POST("/orders", featureFlagService.BlockDuringMaintenance, checkoutGuard, orderH.Create)
 		protected.GET("/orders", orderH.List)
 		protected.GET("/orders/:id", orderH.Get)
 		protected.POST("/orders/:id/cancel", orderH.Cancel)
@@ -262,7 +268,7 @@ func main() {
 		protected.POST("/orders/:id/return", returnsH.Create)
 		protected.GET("/orders/:id/return", returnsH.Get)
 
-		protected.POST("/payment/create", checkoutGuard, paymentH.Create)
+		protected.POST("/payment/create", featureFlagService.BlockDuringMaintenance, checkoutGuard, paymentH.Create)
 		protected.POST("/payment/verify", paymentH.Verify)
 
 		protected.GET("/shipping/track/:orderId", shippingH.Track)
@@ -300,6 +306,9 @@ func main() {
 	adminGroup.Use(middleware.AdminAuthMiddleware(cfg.JWTSecret))
 	adminGroup.Use(ops.AuditMiddleware(db))
 	{
+		adminGroup.GET("/feature-flags", featureFlagService.AdminList)
+		adminGroup.POST("/feature-flags", featureFlagService.Create)
+		adminGroup.PUT("/feature-flags/:key", featureFlagService.Update)
 		adminGroup.GET("/ops/status", opsService.Status)
 		adminGroup.GET("/ops/anomalies", opsService.ListAnomalies)
 		adminGroup.GET("/ops/audit", opsService.ListAudit)

@@ -32,6 +32,8 @@ type AuditEvent struct {
 type auditRoute struct{ action, resource, collection string }
 
 var auditRoutes = map[string]auditRoute{
+	"PUT /api/v1/admin/feature-flags/:key":        {"feature_flag.update", "feature_flag", "feature_flags"},
+	"POST /api/v1/admin/feature-flags":            {"feature_flag.create", "feature_flag", "feature_flags"},
 	"POST /api/v1/admin/products":                 {"product.create", "product", "products"},
 	"PUT /api/v1/admin/products/:id":              {"product.update", "product", "products"},
 	"DELETE /api/v1/admin/products/:id":           {"product.delete", "product", "products"},
