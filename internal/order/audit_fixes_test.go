@@ -298,3 +298,23 @@ func TestCouponReleaseRequiresUsedFlag(t *testing.T) {
 		t.Error("postcondition: CouponReleased should be true")
 	}
 }
+
+func TestProviderCancellationMustBeResolvedBeforeLocalCancellation(t *testing.T) {
+	tests := []struct {
+		name  string
+		order models.Order
+		want  bool
+	}{
+		{name: "not pushed", order: models.Order{}, want: true},
+		{name: "awaiting courier", order: models.Order{ShipmozoOrderID: "SM-1", ShipmozoPushStatus: "awaiting_courier"}, want: false},
+		{name: "provider cancellation confirmed", order: models.Order{ShipmozoOrderID: "SM-1", ShipmozoPushStatus: "cancelled"}, want: true},
+		{name: "provider spelling canceled", order: models.Order{ShipmozoOrderID: "SM-1", ShipmozoPushStatus: "canceled"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := providerCancellationResolved(&tt.order); got != tt.want {
+				t.Fatalf("providerCancellationResolved() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

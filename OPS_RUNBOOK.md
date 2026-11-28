@@ -55,8 +55,9 @@
 1. Compare order shipment fields with the shipment collection and Shipmozo.
 2. If Shipmozo has a shipment but MongoDB has none, do not create another shipment.
 3. If MongoDB has a shipment without an AWB, investigate the provider reference and webhook history.
-4. Verify product weight and dimensions before booking or retrying.
-5. After remediation, verify one shipment, one AWB, tracking URL, courier and customer-visible tracking.
+4. Never cancel a pushed order locally before Shipmozo reports it cancelled. Cancel it in Shipmozo first, then wait for provider confirmation before retrying the local cancellation.
+5. Verify product weight and dimensions before booking or retrying.
+6. After remediation, verify one shipment, one AWB, tracking URL, courier and customer-visible tracking.
 
 ## Inventory incident
 
@@ -84,8 +85,10 @@
 
 - `OPS_PAYMENT_PENDING_STALE`: payment window exceeded.
 - `OPS_PAYMENT_ORDER_MISMATCH`: provider/local order states may disagree.
+- `OPS_PAYMENT_AMOUNT_MISMATCH`: provider amount, currency, or order identity differs from the stored payment; fulfillment is blocked pending reconciliation.
 - `OPS_SHIPMENT_MISSING`: confirmed order has no shipment after the configured threshold.
 - `OPS_SHIPMENT_AWB_MISSING`: shipment exists without an AWB.
+- `OPS_SHIPMENT_CANCELLATION_MISMATCH`: local cancellation was blocked until Shipmozo cancellation is confirmed.
 - `OPS_REFUND_PENDING_STALE`: refund needs provider comparison.
 - `OPS_STOCK_ROLLBACK_INCOMPLETE`: cancelled/expired order needs inventory investigation.
 

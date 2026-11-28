@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,19 @@ import (
 var log = logger.New("PRODUCT", "CATALOG")
 var _ = errcodes.EProdNotFound
 var hsnCodePattern = regexp.MustCompile(`^\d{4,8}$`)
+var requiredCSVColumns = []string{"name", "price", "category", "stock", "weight", "length_cm", "width_cm", "height_cm", "gst_percent", "hsn_code"}
+
+func parseRequiredNonNegativeInt(value string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("value is required")
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("value must be a non-negative integer")
+	}
+	return n, nil
+}
 
 // Cache TTLs — short enough that admin edits show up quickly, long enough to absorb the
 // storefront read storm. Writes also bust the relevant cache (see invalidate*).
@@ -974,8 +988,7 @@ func (h *Handler) BulkUploadCSV(c *gin.Context) {
 		headerMap[strings.TrimSpace(strings.ToLower(h))] = i
 	}
 
-	required := []string{"name", "price", "category", "weight", "length_cm", "width_cm", "height_cm", "gst_percent", "hsn_code"}
-	for _, r := range required {
+	for _, r := range requiredCSVColumns {
 		if _, ok := headerMap[r]; !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required column: " + r})
 			return
@@ -1016,12 +1029,11 @@ func (h *Handler) BulkUploadCSV(c *gin.Context) {
 			continue
 		}
 
-		stock := 100
-		if s := getVal("stock"); s != "" {
-			fmt.Sscanf(s, "%d", &stock)
-		}
-		if stock < 0 {
-			stock = 0
+		stock, stockErr := parseRequiredNonNegativeInt(getVal("stock"))
+		if stockErr != nil {
+			failed++
+			errors = append(errors, name+": stock must be a non-negative integer")
+			continue
 		}
 
 		weight := 0

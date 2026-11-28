@@ -64,9 +64,9 @@ th{background:#f5f5f5;font-weight:600}
 
 	// Line items table
 	if isIntra {
-		sb.WriteString(`<table><thead><tr><th>#</th><th>Description</th><th>HSN</th><th class="text-center">Qty</th><th class="text-right">Unit Price</th><th class="text-right">Taxable</th><th class="text-center">CGST %</th><th class="text-right">CGST</th><th class="text-center">SGST %</th><th class="text-right">SGST</th><th class="text-right">Total</th></tr></thead><tbody>`)
+		sb.WriteString(`<table><thead><tr><th>#</th><th>Description</th><th>HSN</th><th class="text-center">Qty</th><th class="text-right">Unit Price</th><th class="text-right">Discount</th><th class="text-right">Taxable</th><th class="text-center">CGST %</th><th class="text-right">CGST</th><th class="text-center">SGST %</th><th class="text-right">SGST</th><th class="text-right">Total</th></tr></thead><tbody>`)
 	} else {
-		sb.WriteString(`<table><thead><tr><th>#</th><th>Description</th><th>HSN</th><th class="text-center">Qty</th><th class="text-right">Unit Price</th><th class="text-right">Taxable</th><th class="text-center">IGST %</th><th class="text-right">IGST</th><th class="text-right">Total</th></tr></thead><tbody>`)
+		sb.WriteString(`<table><thead><tr><th>#</th><th>Description</th><th>HSN</th><th class="text-center">Qty</th><th class="text-right">Unit Price</th><th class="text-right">Discount</th><th class="text-right">Taxable</th><th class="text-center">IGST %</th><th class="text-right">IGST</th><th class="text-right">Total</th></tr></thead><tbody>`)
 	}
 
 	var totalTaxable, totalGST, grandTotal int
@@ -79,16 +79,16 @@ th{background:#f5f5f5;font-weight:600}
 			halfTax := line.GSTAmount / 2
 			// Handle odd paise: CGST gets floor, SGST gets remainder
 			sgstTax := line.GSTAmount - halfTax
-			sb.WriteString(fmt.Sprintf(`<tr><td>%d</td><td>%s</td><td>%s</td><td class="text-center">%d</td><td class="text-right">₹%.2f</td><td class="text-right">₹%.2f</td><td class="text-center">%d%%</td><td class="text-right">₹%.2f</td><td class="text-center">%d%%</td><td class="text-right">₹%.2f</td><td class="text-right">₹%.2f</td></tr>`,
+			sb.WriteString(fmt.Sprintf(`<tr><td>%d</td><td>%s</td><td>%s</td><td class="text-center">%d</td><td class="text-right">₹%.2f</td><td class="text-right">-₹%.2f</td><td class="text-right">₹%.2f</td><td class="text-center">%d%%</td><td class="text-right">₹%.2f</td><td class="text-center">%d%%</td><td class="text-right">₹%.2f</td><td class="text-right">₹%.2f</td></tr>`,
 				i+1, line.Description, line.HSN, line.Qty,
-				float64(line.UnitPrice)/100, float64(line.TaxableValue)/100,
+				float64(line.UnitPrice)/100, float64(line.Discount)/100, float64(line.TaxableValue)/100,
 				halfRate, float64(halfTax)/100,
 				halfRate, float64(sgstTax)/100,
 				float64(line.LineTotal)/100))
 		} else {
-			sb.WriteString(fmt.Sprintf(`<tr><td>%d</td><td>%s</td><td>%s</td><td class="text-center">%d</td><td class="text-right">₹%.2f</td><td class="text-right">₹%.2f</td><td class="text-center">%d%%</td><td class="text-right">₹%.2f</td><td class="text-right">₹%.2f</td></tr>`,
+			sb.WriteString(fmt.Sprintf(`<tr><td>%d</td><td>%s</td><td>%s</td><td class="text-center">%d</td><td class="text-right">₹%.2f</td><td class="text-right">-₹%.2f</td><td class="text-right">₹%.2f</td><td class="text-center">%d%%</td><td class="text-right">₹%.2f</td><td class="text-right">₹%.2f</td></tr>`,
 				i+1, line.Description, line.HSN, line.Qty,
-				float64(line.UnitPrice)/100, float64(line.TaxableValue)/100,
+				float64(line.UnitPrice)/100, float64(line.Discount)/100, float64(line.TaxableValue)/100,
 				line.GSTRate, float64(line.GSTAmount)/100,
 				float64(line.LineTotal)/100))
 		}
@@ -103,14 +103,6 @@ th{background:#f5f5f5;font-weight:600}
 		sb.WriteString(fmt.Sprintf(`<tr><td>SGST</td><td class="text-right">₹%.2f</td></tr>`, float64(totalGST-totalGST/2)/100))
 	} else {
 		sb.WriteString(fmt.Sprintf(`<tr><td>IGST</td><td class="text-right">₹%.2f</td></tr>`, float64(totalGST)/100))
-	}
-	if order.ShippingCost > 0 {
-		sb.WriteString(fmt.Sprintf(`<tr><td>Shipping</td><td class="text-right">₹%.2f</td></tr>`, float64(order.ShippingCost)/100))
-		grandTotal += order.ShippingCost
-	}
-	if order.Discount > 0 {
-		sb.WriteString(fmt.Sprintf(`<tr><td>Discount</td><td class="text-right">-₹%.2f</td></tr>`, float64(order.Discount)/100))
-		grandTotal -= order.Discount
 	}
 	sb.WriteString(fmt.Sprintf(`<tr style="font-weight:bold;border-top:2px solid #333"><td>Grand Total</td><td class="text-right">₹%.2f</td></tr>`, float64(grandTotal)/100))
 	sb.WriteString(`</table></div>`)

@@ -76,16 +76,28 @@ func sweep(db *mongo.Database, ttl time.Duration) {
 		log.Info("EXPIRY_SWEEPER", "Expired stale orders", "count", expired)
 	}
 
-	// Purge abandoned/expired orders older than 24h — they never became real orders
-	// and no gateway will complete a payment that late. Stock/coupon were already
-	// released at transition time, so a hard delete is safe.
-	purgeCutoff := time.Now().Add(-24 * time.Hour)
-	if res, pErr := db.Collection("orders").DeleteMany(ctx, bson.M{
-		"status":     bson.M{"$in": []string{"abandoned", "expired"}},
-		"updated_at": bson.M{"$lt": purgeCutoff},
-	}); pErr == nil && res.DeletedCount > 0 {
-		log.Info("EXPIRY_SWEEPER", "Purged dead orders", "count", res.DeletedCount)
+	// Archive abandoned/expired orders after 24h instead of deleting them. The
+	// records are needed to reconcile late provider captures, stock movements and
+	// coupon usage. Customer/admin list endpoints hide archived records.
+	archiveCutoff := time.Now().Add(-24 * time.Hour)
+	if archived, archiveErr := archiveDeadOrders(ctx, db, archiveCutoff); archiveErr == nil && archived > 0 {
+		log.Info("EXPIRY_SWEEPER", "Archived dead orders", "count", archived)
+	} else if archiveErr != nil {
+		log.Error("EXPIRY_SWEEPER", "Failed to archive dead orders", "err", archiveErr)
 	}
+}
+
+func archiveDeadOrders(ctx context.Context, db *mongo.Database, cutoff time.Time) (int64, error) {
+	now := time.Now()
+	res, err := db.Collection("orders").UpdateMany(ctx, bson.M{
+		"status":      bson.M{"$in": []string{"abandoned", "expired"}},
+		"updated_at":  bson.M{"$lt": cutoff},
+		"archived_at": bson.M{"$exists": false},
+	}, bson.M{"$set": bson.M{"archived_at": now}})
+	if err != nil {
+		return 0, err
+	}
+	return res.ModifiedCount, nil
 }
 
 // ExpireOrder expires a single pending-payment order, restoring stock and coupon usage.

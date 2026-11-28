@@ -94,7 +94,7 @@ func TestVerifyStripePaymentIntent_Success(t *testing.T) {
 		Status:   "succeeded",
 		Metadata: map[string]string{"order_id": "order-abc", "payment_id": "pay-123"},
 	}
-	if err := VerifyStripePaymentIntent(pi, 50000, "order-abc"); err != nil {
+	if err := VerifyStripePaymentIntent(pi, 50000, "INR", "order-abc"); err != nil {
 		t.Fatalf("valid PI rejected: %v", err)
 	}
 }
@@ -104,7 +104,7 @@ func TestVerifyStripePaymentIntent_WrongStatus(t *testing.T) {
 		ID: "pi_test", Amount: 50000, Currency: "inr", Status: "requires_payment_method",
 		Metadata: map[string]string{"order_id": "order-abc"},
 	}
-	if err := VerifyStripePaymentIntent(pi, 50000, "order-abc"); err == nil {
+	if err := VerifyStripePaymentIntent(pi, 50000, "INR", "order-abc"); err == nil {
 		t.Fatal("wrong status should be rejected")
 	}
 }
@@ -114,7 +114,7 @@ func TestVerifyStripePaymentIntent_AmountMismatch(t *testing.T) {
 		ID: "pi_test", Amount: 99999, Currency: "inr", Status: "succeeded",
 		Metadata: map[string]string{"order_id": "order-abc"},
 	}
-	if err := VerifyStripePaymentIntent(pi, 50000, "order-abc"); err == nil {
+	if err := VerifyStripePaymentIntent(pi, 50000, "INR", "order-abc"); err == nil {
 		t.Fatal("amount mismatch should be rejected")
 	}
 }
@@ -124,7 +124,7 @@ func TestVerifyStripePaymentIntent_MetadataMismatch(t *testing.T) {
 		ID: "pi_test", Amount: 50000, Currency: "inr", Status: "succeeded",
 		Metadata: map[string]string{"order_id": "order-EVIL"},
 	}
-	if err := VerifyStripePaymentIntent(pi, 50000, "order-abc"); err == nil {
+	if err := VerifyStripePaymentIntent(pi, 50000, "INR", "order-abc"); err == nil {
 		t.Fatal("metadata mismatch should be rejected")
 	}
 }

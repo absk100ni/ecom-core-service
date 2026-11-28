@@ -1,11 +1,19 @@
 package invoice
 
 import (
+	"context"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"ecom-core-service/internal/config"
 	"ecom-core-service/internal/models"
+
+	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 func TestGSTInclusiveTaxable(t *testing.T) {
@@ -112,7 +120,7 @@ func TestCGSTSGSTSplit(t *testing.T) {
 
 func TestInvoiceLinesRequireProductTaxData(t *testing.T) {
 	handler := &Handler{cfg: &config.Config{}}
-	order := &models.Order{Items: []models.OrderItem{{ProductID: "product-1", Name: "Work Light", Price: 11800, Quantity: 1}}}
+	order := &models.Order{Subtotal: 11800, Total: 11800, Items: []models.OrderItem{{ProductID: "product-1", Name: "Work Light", Price: 11800, Quantity: 1}}}
 
 	if _, err := handler.computeInvoiceLines(order, map[string]*models.Product{}); err == nil {
 		t.Fatal("expected missing product tax data to block invoice generation")
@@ -126,7 +134,7 @@ func TestInvoiceLinesRequireProductTaxData(t *testing.T) {
 
 func TestInvoiceLinesUseExplicitProductTaxData(t *testing.T) {
 	handler := &Handler{cfg: &config.Config{}}
-	order := &models.Order{Items: []models.OrderItem{{ProductID: "product-1", Name: "Work Light", Price: 11800, Quantity: 1}}}
+	order := &models.Order{Subtotal: 11800, Total: 11800, Items: []models.OrderItem{{ProductID: "product-1", Name: "Work Light", Price: 11800, Quantity: 1}}}
 	lines, err := handler.computeInvoiceLines(order, map[string]*models.Product{
 		"product-1": {ID: "product-1", GSTPercent: 18, HSNCode: "9405"},
 	})
@@ -135,5 +143,123 @@ func TestInvoiceLinesUseExplicitProductTaxData(t *testing.T) {
 	}
 	if len(lines) != 1 || lines[0].GSTRate != 18 || lines[0].HSN != "9405" || lines[0].GSTAmount != 1800 {
 		t.Fatalf("unexpected invoice line: %+v", lines)
+	}
+}
+
+func TestInvoiceLinesAllocateDiscountAndTaxShipping(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{ShippingGSTPercent: 18, ShippingHSNCode: "996812"}}
+	order := &models.Order{
+		Subtotal: 23600, Discount: 2360, ShippingCost: 1180, Total: 22420,
+		Items: []models.OrderItem{
+			{ProductID: "p1", Name: "Light", Price: 11800, Quantity: 1},
+			{ProductID: "p2", Name: "Cable", Price: 5900, Quantity: 2},
+		},
+	}
+	products := map[string]*models.Product{
+		"p1": {ID: "p1", GSTPercent: 18, HSNCode: "9405"},
+		"p2": {ID: "p2", GSTPercent: 18, HSNCode: "8544"},
+	}
+	lines, err := handler.computeInvoiceLines(order, products)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("line count = %d, want 3", len(lines))
+	}
+	var discount, total int
+	for _, line := range lines {
+		discount += line.Discount
+		total += line.LineTotal
+		if line.TaxableValue+line.GSTAmount != line.LineTotal {
+			t.Fatalf("tax components do not reconcile: %+v", line)
+		}
+	}
+	if discount != order.Discount || total != order.Total {
+		t.Fatalf("discount=%d total=%d, want discount=%d total=%d", discount, total, order.Discount, order.Total)
+	}
+	if lines[2].Description != "Shipping" || lines[2].HSN != "996812" {
+		t.Fatalf("shipping line missing tax identity: %+v", lines[2])
+	}
+}
+
+func TestInvoiceRejectsUnconfiguredShippingTax(t *testing.T) {
+	handler := &Handler{cfg: &config.Config{}}
+	order := &models.Order{Subtotal: 11800, ShippingCost: 500, Total: 12300, Items: []models.OrderItem{{ProductID: "p1", Name: "Light", Price: 11800, Quantity: 1}}}
+	_, err := handler.computeInvoiceLines(order, map[string]*models.Product{"p1": {ID: "p1", GSTPercent: 18, HSNCode: "9405"}})
+	if err == nil {
+		t.Fatal("expected shipping tax configuration to be required")
+	}
+}
+
+func TestPartialCODInvoiceRequiresCollection(t *testing.T) {
+	order := &models.Order{PaymentStatus: "paid", PaymentPlan: "partial", CODAmount: 8000}
+	if err := invoiceEligible(order); err == nil {
+		t.Fatal("expected invoice to be blocked before COD collection")
+	}
+	order.CODCollected = true
+	if err := invoiceEligible(order); err != nil {
+		t.Fatalf("invoice should be eligible after COD collection: %v", err)
+	}
+}
+
+func invoiceTestDB(t *testing.T) *mongo.Database {
+	uri := os.Getenv("OPS_TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("set OPS_TEST_MONGO_URI for Mongo-backed invoice tests")
+	}
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := client.Database("invoice_concurrency_" + uuid.NewString())
+	t.Cleanup(func() { _ = db.Drop(context.Background()); _ = client.Disconnect(context.Background()) })
+	return db
+}
+
+func TestConcurrentInvoiceAssignmentUsesOneNumber(t *testing.T) {
+	db := invoiceTestDB(t)
+	ctx := context.Background()
+	order := models.Order{ID: "order-1", OrderNumber: "ORD-1", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if _, err := db.Collection("orders").InsertOne(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	handler := &Handler{db: db, cfg: &config.Config{}}
+	const callers = 20
+	results := make(chan string, callers)
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			number, _, err := handler.assignInvoiceNumber(ctx, &order)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- number
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var winner string
+	for number := range results {
+		if winner == "" {
+			winner = number
+		}
+		if number != winner {
+			t.Fatalf("concurrent callers observed %q and %q", winner, number)
+		}
+	}
+	var stored bson.M
+	if err := db.Collection("orders").FindOne(ctx, bson.M{"_id": order.ID}).Decode(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored["invoice_number"] != winner {
+		t.Fatalf("stored invoice = %v, winner = %s", stored["invoice_number"], winner)
 	}
 }

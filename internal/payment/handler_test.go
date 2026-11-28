@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"ecom-core-service/internal/config"
+	"ecom-core-service/internal/models"
 )
 
 func TestHmacSHA256(t *testing.T) {
@@ -120,5 +121,46 @@ func TestActiveGatewayAllowsMockOnlyInDevelopment(t *testing.T) {
 	handler := &Handler{cfg: &config.Config{Environment: "development", PaymentGateway: "razorpay"}}
 	if got := handler.activeGateway(); got != "mock" {
 		t.Fatalf("activeGateway() = %q, want mock", got)
+	}
+}
+
+func TestValidateProviderPaymentRejectsMonetaryMismatch(t *testing.T) {
+	payment := &models.Payment{RazorpayOrderID: "order_provider", Amount: 50000, Currency: "INR"}
+	tests := []struct {
+		name     string
+		evidence providerPaymentEvidence
+		kind     string
+	}{
+		{name: "valid", evidence: providerPaymentEvidence{ProviderOrderID: "order_provider", Amount: 50000, Currency: "inr", Status: "captured"}},
+		{name: "amount", evidence: providerPaymentEvidence{ProviderOrderID: "order_provider", Amount: 1, Currency: "INR", Status: "captured"}, kind: "amount"},
+		{name: "currency", evidence: providerPaymentEvidence{ProviderOrderID: "order_provider", Amount: 50000, Currency: "USD", Status: "captured"}, kind: "currency"},
+		{name: "provider order", evidence: providerPaymentEvidence{ProviderOrderID: "other", Amount: 50000, Currency: "INR", Status: "captured"}, kind: "order"},
+		{name: "status", evidence: providerPaymentEvidence{ProviderOrderID: "order_provider", Amount: 50000, Currency: "INR", Status: "authorized"}, kind: "status"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateProviderPayment(tt.evidence, payment, "captured")
+			if tt.kind == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			validationErr, ok := err.(*paymentValidationError)
+			if !ok || validationErr.Kind != tt.kind {
+				t.Fatalf("error = %#v, want kind %q", err, tt.kind)
+			}
+		})
+	}
+}
+
+func TestDecodeCashfreeWebhookEvidence(t *testing.T) {
+	body := []byte(`{"type":"PAYMENT_SUCCESS_WEBHOOK","data":{"order":{"order_id":"order-1"},"payment":{"cf_payment_id":"pay-1","payment_status":"SUCCESS","payment_amount":123.45,"payment_currency":"INR"}}}`)
+	eventType, evidence, err := decodeCashfreeWebhookEvidence(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eventType != "PAYMENT_SUCCESS_WEBHOOK" || evidence.OrderID != "order-1" || evidence.Amount != 12345 || evidence.Currency != "INR" || evidence.Status != "SUCCESS" {
+		t.Fatalf("unexpected evidence: type=%s evidence=%+v", eventType, evidence)
 	}
 }

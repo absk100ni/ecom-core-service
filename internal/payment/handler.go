@@ -184,10 +184,10 @@ func (h *Handler) createCashfreeOrder(amountPaise int, currency, orderID, custom
 	return fmt.Sprintf("%.0f", cfOrderID), paySessionID, nil
 }
 
-func (h *Handler) verifyCashfreePayment(orderID string) (string, error) {
+func (h *Handler) verifyCashfreePayment(orderID string) (cashfreeOrderEvidence, error) {
 	req, err := http.NewRequest("GET", h.cashfreeBaseURL()+"/orders/"+orderID, nil)
 	if err != nil {
-		return "", err
+		return cashfreeOrderEvidence{}, err
 	}
 	req.Header.Set("x-client-id", h.cfg.CashfreeAppID)
 	req.Header.Set("x-client-secret", h.cfg.CashfreeSecret)
@@ -195,14 +195,18 @@ func (h *Handler) verifyCashfreePayment(orderID string) (string, error) {
 
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		return "", err
+		return cashfreeOrderEvidence{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-	status, _ := result["order_status"].(string)
-	return status, nil
+	if resp.StatusCode >= 400 {
+		return cashfreeOrderEvidence{}, fmt.Errorf("cashfree verification status %d: %s", resp.StatusCode, string(body))
+	}
+	result, err := decodeCashfreeOrderEvidence(body)
+	if err != nil {
+		return cashfreeOrderEvidence{}, fmt.Errorf("cashfree verification decode: %w", err)
+	}
+	return result, nil
 }
 
 // ==================== HANDLERS ====================
@@ -556,6 +560,19 @@ func (h *Handler) verifyRazorpay(c *gin.Context, ctx context.Context, userID, rz
 		}
 	}
 
+	providerPayment, providerErr := h.fetchRazorpayPayment(rzpPaymentID)
+	if providerErr != nil {
+		log.Error("VERIFY", "Razorpay payment lookup failed", "payment_id", rzpPaymentID, "err", providerErr.Error())
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to verify payment with Razorpay"})
+		return
+	}
+	if validationErr := validateProviderPayment(providerPayment, &payment, "captured"); validationErr != nil {
+		h.recordPaymentValidationMismatch(&payment, providerPayment, validationErr)
+		log.WarnWithCode("VERIFY", errcodes.EPayVerifyFailed.Code, "Razorpay payment validation failed", "payment_id", rzpPaymentID, "reason", validationErr.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Payment verification failed", "code": errcodes.EPayVerifyFailed.Code})
+		return
+	}
+
 	firstTransition := h.markPaymentPaid(ctx, payment.ID, payment.OrderID, rzpPaymentID)
 	log.Info("VERIFY", "Razorpay payment verified", "payment_id", payment.ID, "order_id", payment.OrderID, "first_transition", firstTransition)
 
@@ -585,17 +602,18 @@ func (h *Handler) verifyCashfree(c *gin.Context, ctx context.Context, userID, or
 		return
 	}
 
-	// Verify with Cashfree API
-	status, err := h.verifyCashfreePayment(orderID)
+	// Verify amount, currency and captured status with Cashfree before marking paid.
+	cashfreeOrder, err := h.verifyCashfreePayment(orderID)
 	if err != nil {
 		log.Error("VERIFY", "Cashfree verification API failed", "err", err.Error())
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Verification failed"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Verification failed"})
 		return
 	}
-
-	if status != "PAID" {
-		log.Warn("VERIFY", "Cashfree payment not paid", "status", status, "order_id", orderID)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Payment not completed", "cashfree_status": status})
+	evidence := providerPaymentEvidence{Provider: "cashfree", Amount: cashfreeOrder.Amount, Currency: cashfreeOrder.Currency, Status: cashfreeOrder.Status}
+	if validationErr := validateProviderPayment(evidence, &payment, "PAID"); validationErr != nil {
+		h.recordPaymentValidationMismatch(&payment, evidence, validationErr)
+		log.WarnWithCode("VERIFY", errcodes.EPayVerifyFailed.Code, "Cashfree payment validation failed", "reason", validationErr.Error(), "order_id", orderID)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Payment verification failed", "code": errcodes.EPayVerifyFailed.Code})
 		return
 	}
 
@@ -646,43 +664,62 @@ func (h *Handler) refundUnfulfillablePayment(ctx context.Context, order *models.
 		return
 	}
 
-	refundStatus := "refund_pending"
 	refundID := ""
 	refundErr := fmt.Errorf("automatic refund is unavailable for this payment provider")
 	if strings.HasPrefix(gatewayPaymentID, "pay_") && h.cfg.RazorpayKeyID != "" && h.cfg.RazorpaySecret != "" {
 		refundID, refundErr = h.razorpayRefund(gatewayPaymentID, payment.Amount)
-	}
-	if refundErr == nil && refundID != "" {
-		refundStatus = "refunded"
+	} else if strings.HasPrefix(gatewayPaymentID, "pi_") && h.cfg.StripeSecretKey != "" {
+		var refund *StripeRefund
+		refund, refundErr = h.CreateStripeRefund(gatewayPaymentID, payment.Amount)
+		if refundErr == nil && refund != nil {
+			refundID = refund.ID
+		}
 	}
 
 	now := time.Now()
-	orderSet := bson.M{
-		"payment_status":          refundStatus,
-		"payment_id":              gatewayPaymentID,
-		"refund_requested_amount": payment.Amount,
-		"cancel_reason":           reason,
-		"updated_at":              now,
+	if refundErr != nil || refundID == "" {
+		if refundErr == nil {
+			refundErr = fmt.Errorf("provider returned no refund id")
+		}
+		_, _ = h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{
+			"payment_status":                 "refund_pending",
+			"payment_id":                     gatewayPaymentID,
+			"refund_requested_amount":        payment.Amount,
+			"cancel_reason":                  reason,
+			"refund_processing":              true,
+			"refund_reconciliation_required": true,
+			"refund_reconciliation_error":    refundErr.Error(),
+			"refund_processing_started_at":   now,
+			"updated_at":                     now,
+		}})
+		// Keep the payment claim in refund_processing. A webhook retry cannot issue
+		// a second refund until an operator reconciles the provider outcome.
+		log.Error("LATE_REFUND", "Captured payment refund outcome is ambiguous; reconciliation required", "order_id", order.ID, "payment_id", gatewayPaymentID, "err", refundErr)
+		return
 	}
-	orderUpdate := bson.M{"$set": orderSet}
-	if refundStatus == "refunded" {
-		orderSet["refund_id"] = refundID
-		orderSet["refund_amount"] = payment.Amount
-		orderSet["refund_requested_amount"] = 0
-		orderSet["refunded_at"] = now
-		orderUpdate["$push"] = bson.M{"refunds": bson.M{"refund_id": refundID, "amount": payment.Amount, "processed_at": now}}
+
+	orderUpdate := bson.M{
+		"$set": bson.M{
+			"payment_status": "refunded", "payment_id": gatewayPaymentID,
+			"refund_requested_amount": 0, "cancel_reason": reason,
+			"refund_id": refundID, "refund_amount": payment.Amount,
+			"refunded_at": now, "updated_at": now,
+		},
+		"$push": bson.M{"refunds": bson.M{"refund_id": refundID, "amount": payment.Amount, "processed_at": now}},
 	}
-	if _, err := h.db.Collection("orders").UpdateOne(ctx,
-		bson.M{"_id": order.ID, "status": order.Status}, orderUpdate); err != nil {
-		h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"refund_reconciliation_required": true, "refund_reconciliation_id": refundID, "updated_at": time.Now()}})
-		log.Error("LATE_REFUND", "Payment refund state could not be reconciled to order", "order_id", order.ID, "refund_id", refundID, "err", err)
+	result, updateErr := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": order.ID, "status": order.Status}, orderUpdate)
+	if updateErr != nil || result.MatchedCount == 0 {
+		_, _ = h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{
+			"refund_processing": true, "refund_reconciliation_required": true,
+			"refund_reconciliation_id": refundID, "updated_at": time.Now(),
+		}})
+		log.Error("LATE_REFUND", "Payment refund state could not be reconciled to order", "order_id", order.ID, "refund_id", refundID, "err", updateErr)
+		return
 	}
-	h.db.Collection("payments").UpdateOne(ctx, bson.M{"_id": paymentID}, bson.M{"$set": bson.M{
-		"razorpay_payment_id": gatewayPaymentID, "status": refundStatus, "updated_at": now,
+	_, _ = h.db.Collection("payments").UpdateOne(ctx, bson.M{"_id": paymentID, "status": "refund_processing"}, bson.M{"$set": bson.M{
+		"razorpay_payment_id": gatewayPaymentID, "status": "refunded", "updated_at": now,
 	}})
-	if refundErr != nil {
-		log.Error("LATE_REFUND", "Captured payment requires manual refund", "order_id", order.ID, "payment_id", gatewayPaymentID, "err", refundErr)
-	}
 }
 
 // markPaymentPaid transitions a payment+order to paid. It is idempotent: the order is
@@ -700,6 +737,11 @@ func (h *Handler) markPaymentPaid(ctx context.Context, paymentID, orderID, gatew
 	var pre models.Order
 	if err := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": orderID}).Decode(&pre); err != nil {
 		log.Error("MARK_PAID", "Order not found for captured payment", "order_id", orderID, "payment_id", gatewayPaymentID)
+		return false
+	}
+
+	if pre.PaymentValidationMismatch {
+		log.ErrorWithCode("MARK_PAID", errcodes.EPayVerifyFailed.Code, "Payment is blocked pending amount/currency reconciliation", "order_id", orderID, "payment_id", gatewayPaymentID)
 		return false
 	}
 
@@ -736,7 +778,7 @@ func (h *Handler) markPaymentPaid(ctx context.Context, paymentID, orderID, gatew
 	// Only flip the order if it hasn't already been paid. MatchedCount==0 means a
 	// concurrent/duplicate delivery already handled it.
 	res, err := h.db.Collection("orders").UpdateOne(ctx,
-		bson.M{"_id": orderID, "status": "placed", "payment_status": "pending"},
+		bson.M{"_id": orderID, "status": "placed", "payment_status": "pending", "payment_validation_mismatch": bson.M{"$ne": true}},
 		bson.M{"$set": bson.M{
 			"payment_id": gatewayPaymentID, "payment_status": "paid", "status": "confirmed", "updated_at": now,
 		}})
@@ -884,10 +926,7 @@ func (h *Handler) stripeWebhook(c *gin.Context, body []byte) {
 	switch event.Type {
 	case "payment_intent.succeeded":
 		var data struct {
-			Object struct {
-				ID       string            `json:"id"`
-				Metadata map[string]string `json:"metadata"`
-			} `json:"object"`
+			Object StripePaymentIntent `json:"object"`
 		}
 		if err := json.Unmarshal(event.Data, &data); err == nil && data.Object.ID != "" {
 			orderID := data.Object.Metadata["order_id"]
@@ -898,10 +937,15 @@ func (h *Handler) stripeWebhook(c *gin.Context, body []byte) {
 				if paymentID != "" {
 					filter["_id"] = paymentID
 				}
-				h.db.Collection("payments").FindOne(ctx, filter).Decode(&p)
-				if p.OrderID != "" {
-					h.markPaymentPaid(ctx, p.ID, p.OrderID, data.Object.ID)
-					log.Info("WEBHOOK", "Stripe payment_intent.succeeded", "order_id", p.OrderID, "pi_id", data.Object.ID)
+				if findErr := h.db.Collection("payments").FindOne(ctx, filter).Decode(&p); findErr == nil {
+					evidence := providerPaymentEvidence{Provider: "stripe", PaymentID: data.Object.ID, ProviderOrderID: data.Object.ID, Amount: data.Object.Amount, Currency: data.Object.Currency, Status: data.Object.Status}
+					if validationErr := validateProviderPayment(evidence, &p, "succeeded"); validationErr != nil {
+						h.recordPaymentValidationMismatch(&p, evidence, validationErr)
+						log.WarnWithCode("WEBHOOK", errcodes.EPayWebhookFailed.Code, "Stripe webhook payment validation failed", "order_id", p.OrderID, "reason", validationErr.Error())
+					} else {
+						h.markPaymentPaid(ctx, p.ID, p.OrderID, data.Object.ID)
+						log.Info("WEBHOOK", "Stripe payment_intent.succeeded", "order_id", p.OrderID, "pi_id", data.Object.ID)
+					}
 				}
 			}
 		}
@@ -959,15 +1003,26 @@ func (h *Handler) razorpayWebhook(c *gin.Context, body []byte) {
 	log.Info("WEBHOOK", "Razorpay webhook", "event", payload.Event)
 
 	if payload.Event == "payment.captured" {
-		if pe, ok := payload.Payload["payment"].(map[string]interface{}); ok {
-			if e, ok := pe["entity"].(map[string]interface{}); ok {
-				rid, _ := e["order_id"].(string)
-				pid, _ := e["id"].(string)
+		if paymentPayload, ok := payload.Payload["payment"].(map[string]interface{}); ok {
+			entityBytes, _ := json.Marshal(paymentPayload["entity"])
+			var entity struct {
+				ID       string `json:"id"`
+				OrderID  string `json:"order_id"`
+				Amount   int    `json:"amount"`
+				Currency string `json:"currency"`
+				Status   string `json:"status"`
+			}
+			if json.Unmarshal(entityBytes, &entity) == nil && entity.OrderID != "" && entity.ID != "" {
 				var p models.Payment
-				h.db.Collection("payments").FindOne(ctx, bson.M{"razorpay_order_id": rid}).Decode(&p)
-				if p.OrderID != "" {
-					h.markPaymentPaid(ctx, p.ID, p.OrderID, pid)
-					log.Info("WEBHOOK", "Razorpay payment captured", "order_id", p.OrderID)
+				if findErr := h.db.Collection("payments").FindOne(ctx, bson.M{"razorpay_order_id": entity.OrderID}).Decode(&p); findErr == nil {
+					evidence := providerPaymentEvidence{Provider: "razorpay", PaymentID: entity.ID, ProviderOrderID: entity.OrderID, Amount: entity.Amount, Currency: entity.Currency, Status: entity.Status}
+					if validationErr := validateProviderPayment(evidence, &p, "captured"); validationErr != nil {
+						h.recordPaymentValidationMismatch(&p, evidence, validationErr)
+						log.WarnWithCode("WEBHOOK", errcodes.EPayWebhookFailed.Code, "Razorpay webhook payment validation failed", "order_id", p.OrderID, "reason", validationErr.Error())
+					} else {
+						h.markPaymentPaid(ctx, p.ID, p.OrderID, entity.ID)
+						log.Info("WEBHOOK", "Razorpay payment captured", "order_id", p.OrderID)
+					}
 				}
 			}
 		}
@@ -993,30 +1048,31 @@ func (h *Handler) cashfreeWebhook(c *gin.Context, body []byte) {
 		return
 	}
 
-	var payload map[string]interface{}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid"})
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventType, _ := payload["type"].(string)
+	eventType, evidenceData, decodeErr := decodeCashfreeWebhookEvidence(body)
+	if decodeErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payment evidence"})
+		return
+	}
 	log.Info("WEBHOOK", "Cashfree webhook", "type", eventType)
 
 	if eventType == "PAYMENT_SUCCESS_WEBHOOK" || eventType == "ORDER_PAID" {
-		data, _ := payload["data"].(map[string]interface{})
-		if data != nil {
-			orderData, _ := data["order"].(map[string]interface{})
-			if orderData != nil {
-				oid, _ := orderData["order_id"].(string)
-				if oid != "" {
-					var p models.Payment
-					h.db.Collection("payments").FindOne(ctx, bson.M{"order_id": oid}).Decode(&p)
-					if p.OrderID != "" {
-						h.markPaymentPaid(ctx, p.ID, p.OrderID, "cf_webhook_"+oid)
-						log.Info("WEBHOOK", "Cashfree payment confirmed", "order_id", p.OrderID)
+		if evidenceData.OrderID != "" {
+			var p models.Payment
+			if findErr := h.db.Collection("payments").FindOne(ctx, bson.M{"order_id": evidenceData.OrderID}).Decode(&p); findErr == nil {
+				evidence := providerPaymentEvidence{Provider: "cashfree", PaymentID: evidenceData.PaymentID, Amount: evidenceData.Amount, Currency: evidenceData.Currency, Status: evidenceData.Status}
+				if validationErr := validateProviderPayment(evidence, &p, "SUCCESS", "PAID"); validationErr != nil {
+					h.recordPaymentValidationMismatch(&p, evidence, validationErr)
+					log.WarnWithCode("WEBHOOK", errcodes.EPayWebhookFailed.Code, "Cashfree webhook payment validation failed", "order_id", p.OrderID, "reason", validationErr.Error())
+				} else {
+					gatewayPaymentID := evidenceData.PaymentID
+					if gatewayPaymentID == "" {
+						gatewayPaymentID = "cf_" + evidenceData.OrderID
 					}
+					h.markPaymentPaid(ctx, p.ID, p.OrderID, gatewayPaymentID)
+					log.Info("WEBHOOK", "Cashfree payment confirmed", "order_id", p.OrderID)
 				}
 			}
 		}
@@ -1058,9 +1114,18 @@ func (h *Handler) verifyStripe(c *gin.Context, ctx context.Context, userID, orde
 		return
 	}
 
-	if err := VerifyStripePaymentIntent(pi, payment.Amount, orderID); err != nil {
-		log.WarnWithCode("VERIFY", errcodes.EPayVerifyFailed.Code, "Stripe verification failed", "reason", err.Error())
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Payment verification failed: " + err.Error(), "code": errcodes.EPayVerifyFailed.Code})
+	evidence := providerPaymentEvidence{Provider: "stripe", PaymentID: pi.ID, ProviderOrderID: pi.ID, Amount: pi.Amount, Currency: pi.Currency, Status: pi.Status}
+	if validationErr := validateProviderPayment(evidence, &payment, "succeeded"); validationErr != nil {
+		h.recordPaymentValidationMismatch(&payment, evidence, validationErr)
+		log.WarnWithCode("VERIFY", errcodes.EPayVerifyFailed.Code, "Stripe verification failed", "reason", validationErr.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Payment verification failed", "code": errcodes.EPayVerifyFailed.Code})
+		return
+	}
+	if pi.Metadata["order_id"] != orderID {
+		validationErr := &paymentValidationError{Kind: "order", Err: fmt.Errorf("Stripe order metadata mismatch")}
+		h.recordPaymentValidationMismatch(&payment, evidence, validationErr)
+		log.WarnWithCode("VERIFY", errcodes.EPayVerifyFailed.Code, "Stripe verification failed", "reason", validationErr.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Payment verification failed", "code": errcodes.EPayVerifyFailed.Code})
 		return
 	}
 

@@ -122,6 +122,30 @@ func TestMonitorLeaseAndAnomalyLifecycle(t *testing.T) {
 	}
 }
 
+func TestPaymentAndShipmentMismatchAnomalies(t *testing.T) {
+	db := integrationDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_, err := db.Collection("orders").InsertMany(ctx, []interface{}{
+		bson.M{"_id": "payment-mismatch", "status": "placed", "payment_status": "pending", "payment_validation_mismatch": true, "created_at": now, "updated_at": now},
+		bson.M{"_id": "shipment-mismatch", "status": "processing", "payment_status": "paid", "shipment_cancellation_blocked": true, "shipment_id": "shipment-1", "created_at": now, "updated_at": now},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(db, &config.Config{PendingOrderTTLMinutes: 30, OpsShipmentStaleMinutes: 100000, OpsRefundStaleMinutes: 60}, nil)
+	service.now = func() time.Time { return now }
+	if err := service.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{EventPaymentAmountMismatch + ":payment-mismatch", EventShipmentCancelMismatch + ":shipment-mismatch"} {
+		var anomaly Anomaly
+		if err := db.Collection("ops_anomalies").FindOne(ctx, bson.M{"_id": key, "active": true}).Decode(&anomaly); err != nil {
+			t.Fatalf("missing active anomaly %s: %v", key, err)
+		}
+	}
+}
+
 func TestAuditMiddlewareStoresOnlySafeSnapshot(t *testing.T) {
 	db := integrationDB(t)
 	ctx := context.Background()

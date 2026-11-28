@@ -52,11 +52,12 @@ type serviceabilityChecker interface {
 }
 
 type Handler struct {
-	db       *mongo.Database
-	cfg      *config.Config
-	useTxn   bool // true when the Mongo deployment supports multi-document transactions (replica set)
-	notifier *notify.Notifier
-	shipping serviceabilityChecker
+	db            *mongo.Database
+	cfg           *config.Config
+	useTxn        bool // true when the Mongo deployment supports multi-document transactions (replica set)
+	notifier      *notify.Notifier
+	shipping      serviceabilityChecker
+	refundPayment func(paymentID string, amount int) (string, error) // test hook; nil uses configured provider
 }
 
 func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
@@ -533,8 +534,9 @@ func (h *Handler) List(c *gin.Context) {
 	opts := options.Find().SetSort(bson.M{"created_at": -1}).SetLimit(50)
 	// Abandoned/expired orders never became real orders — hide them from the customer.
 	cursor, err := h.db.Collection("orders").Find(ctx, bson.M{
-		"user_id": userID,
-		"status":  bson.M{"$nin": []string{"abandoned", "expired"}},
+		"user_id":     userID,
+		"status":      bson.M{"$nin": []string{"abandoned", "expired"}},
+		"archived_at": bson.M{"$exists": false},
 	}, opts)
 	if err != nil {
 		log.ErrorWithCode("LIST", errcodes.EOrdListFailed.Code, "Failed to list orders", "user_id", userID, "err", err)
@@ -552,9 +554,10 @@ func (h *Handler) List(c *gin.Context) {
 
 // Abandon is called by the storefront when the payment window is dismissed or the
 // payment fails. All-or-nothing UX: the order disappears (stock + coupon released,
-// hidden from the user, purged by the sweeper after 24h). If the payment actually
-// completed concurrently (late UPI approval), it reports paid=true instead so the
-// frontend can show the success screen.
+// hidden from the user). If the payment actually completed concurrently (late UPI
+// approval), it reports paid=true instead so the frontend can show the success screen.
+// The sweeper archives the record after 24 hours so late provider captures and
+// inventory movements remain auditable.
 func (h *Handler) Abandon(c *gin.Context) {
 	userID := c.GetString("user_id")
 	orderID := c.Param("id")
@@ -584,6 +587,28 @@ func (h *Handler) Abandon(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"paid": order.PaymentStatus == "paid", "status": order.Status})
 }
 
+func providerCancellationResolved(order *models.Order) bool {
+	if strings.TrimSpace(order.ShipmozoOrderID) == "" {
+		return true
+	}
+	status := strings.ToLower(strings.TrimSpace(order.ShipmozoPushStatus))
+	switch status {
+	case "cancelled", "canceled", "cancelled_at_provider", "cancellation_confirmed":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) recordShipmentCancellationBlock(ctx context.Context, order *models.Order) {
+	now := time.Now()
+	_, _ = h.db.Collection("orders").UpdateOne(ctx, bson.M{"_id": order.ID}, bson.M{"$set": bson.M{
+		"shipment_cancellation_blocked":    true,
+		"shipment_cancellation_blocked_at": now,
+		"updated_at":                       now,
+	}})
+}
+
 func (h *Handler) Cancel(c *gin.Context) {
 	userID := c.GetString("user_id")
 	orderID := c.Param("id")
@@ -602,7 +627,17 @@ func (h *Handler) Cancel(c *gin.Context) {
 		return
 	}
 
-	if order.Status != "placed" && order.Status != "confirmed" {
+	if !providerCancellationResolved(&order) {
+		h.recordShipmentCancellationBlock(ctx, &order)
+		log.WarnWithCode("CANCEL", errcodes.EOrdCancelFailed.Code, "Local cancellation blocked until Shipmozo cancellation is confirmed", "order_id", orderID, "shipmozo_order_id", order.ShipmozoOrderID)
+		c.JSON(http.StatusConflict, gin.H{
+			"error":             "This order already exists in Shipmozo. Cancel it in Shipmozo first, wait for provider cancellation confirmation, then retry.",
+			"code":              errcodes.EOrdCancelFailed.Code,
+			"shipmozo_order_id": order.ShipmozoOrderID,
+		})
+		return
+	}
+	if order.Status != "placed" && order.Status != "confirmed" && order.Status != "processing" {
 		log.WarnWithCode("CANCEL", errcodes.EOrdCancelFailed.Code, "Cannot cancel order with current status", "order_id", orderID, "status", order.Status, "user_id", userID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Cannot cancel order with status '%s'", order.Status), "code": errcodes.EOrdCancelFailed.Code})
 		return
@@ -613,7 +648,7 @@ func (h *Handler) Cancel(c *gin.Context) {
 	if order.PaymentPlan == "partial" && order.AdvanceAmount > 0 {
 		refundableOnline = order.AdvanceAmount
 	}
-	update := bson.M{"status": "cancelled", "cancel_reason": req.Reason, "cancelled_at": now, "updated_at": now}
+	update := bson.M{"status": "cancelled", "cancel_reason": req.Reason, "cancelled_at": now, "updated_at": now, "shipment_cancellation_blocked": false}
 	if order.PaymentStatus == "paid" {
 		update["refund_requested_amount"] = refundableOnline
 		update["payment_status"] = "refund_pending"
@@ -655,7 +690,7 @@ func (h *Handler) AdminList(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	filter := bson.M{}
+	filter := bson.M{"archived_at": bson.M{"$exists": false}}
 	if status := c.Query("status"); status != "" {
 		filter["status"] = status
 	}
@@ -762,6 +797,15 @@ func (h *Handler) UpdateStatus(c *gin.Context) {
 		})
 		return
 	}
+	if req.Status == "cancelled" && !providerCancellationResolved(&order) {
+		h.recordShipmentCancellationBlock(ctx, &order)
+		c.JSON(http.StatusConflict, gin.H{
+			"error":             "Cancel this order in Shipmozo first. Retry after provider cancellation is confirmed.",
+			"code":              errcodes.EOrdCancelFailed.Code,
+			"shipmozo_order_id": order.ShipmozoOrderID,
+		})
+		return
+	}
 
 	now := time.Now()
 	setFields := bson.M{"status": req.Status, "updated_at": now}
@@ -781,6 +825,7 @@ func (h *Handler) UpdateStatus(c *gin.Context) {
 	}
 	if req.Status == "cancelled" {
 		setFields["cancelled_at"] = now
+		setFields["shipment_cancellation_blocked"] = false
 		if order.PaymentStatus == "paid" {
 			setFields["payment_status"] = "refund_pending"
 			setFields["refund_requested_amount"] = refundableOnline
@@ -987,58 +1032,73 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Refund processed", "refund_id": refundID, "refund_amount": refundAmount, "order_number": order.OrderNumber})
 }
 
-// attemptAutoRefund tries to refund a paid order via the active gateway.
-// If the refund API call fails, the order stays cancelled with refund_pending status.
+// attemptAutoRefund claims the refund before contacting the provider. Any
+// provider error is ambiguous: the provider may have accepted the request and
+// lost the response. In that case the claim stays locked until reconciliation.
 func (h *Handler) attemptAutoRefund(ctx context.Context, order *models.Order, amount int) {
-	// Max refundable for partial plan
-	if order.PaymentPlan == "partial" && order.AdvanceAmount > 0 {
-		if amount > order.AdvanceAmount {
-			amount = order.AdvanceAmount
-		}
+	if order.PaymentPlan == "partial" && order.AdvanceAmount > 0 && amount > order.AdvanceAmount {
+		amount = order.AdvanceAmount
+	}
+
+	claim, claimErr := h.db.Collection("orders").UpdateOne(ctx, bson.M{
+		"_id":                            order.ID,
+		"payment_status":                 "refund_pending",
+		"refund_processing":              bson.M{"$ne": true},
+		"refund_reconciliation_required": bson.M{"$ne": true},
+	}, bson.M{"$set": bson.M{"refund_processing": true, "refund_processing_started_at": time.Now()}})
+	if claimErr != nil || claim.MatchedCount == 0 {
+		log.Warn("AUTO_REFUND", "Refund already in progress or requires reconciliation", "order_id", order.ID, "err", claimErr)
+		return
 	}
 
 	var refundID string
 	var refundErr error
-
-	// Select the provider from the payment id that was actually captured. Do not
-	// infer it from whichever credentials happen to be configured today.
-	switch {
-	case strings.HasPrefix(order.PaymentID, "pay_") && h.cfg.RazorpayKeyID != "" && h.cfg.RazorpaySecret != "":
-		refundID, refundErr = h.processRazorpayRefund(order.PaymentID, amount)
-	case strings.HasPrefix(order.PaymentID, "pi_") && h.cfg.StripeSecretKey != "":
-		refundID, refundErr = h.processStripeRefund(order.PaymentID, amount)
-	default:
-		refundErr = fmt.Errorf("refund provider unavailable for payment %s", order.PaymentID)
+	if h.refundPayment != nil {
+		refundID, refundErr = h.refundPayment(order.PaymentID, amount)
+	} else {
+		switch {
+		case strings.HasPrefix(order.PaymentID, "pay_") && h.cfg.RazorpayKeyID != "" && h.cfg.RazorpaySecret != "":
+			refundID, refundErr = h.processRazorpayRefund(order.PaymentID, amount)
+		case strings.HasPrefix(order.PaymentID, "pi_") && h.cfg.StripeSecretKey != "":
+			refundID, refundErr = h.processStripeRefund(order.PaymentID, amount)
+		default:
+			refundErr = fmt.Errorf("refund provider unavailable for payment %s", order.PaymentID)
+		}
 	}
 
 	now := time.Now()
-	if refundErr != nil {
-		log.Error("AUTO_REFUND", "Gateway refund failed — order stays refund_pending", "order_id", order.ID, "err", refundErr)
+	if refundErr != nil || refundID == "" {
+		if refundErr == nil {
+			refundErr = fmt.Errorf("provider returned no refund id")
+		}
+		_, _ = h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID, "refund_processing": true}, bson.M{"$set": bson.M{
+			"refund_reconciliation_required": true,
+			"refund_reconciliation_error":    refundErr.Error(),
+			"updated_at":                     now,
+		}})
+		log.Error("AUTO_REFUND", "Gateway refund outcome is ambiguous; reconciliation required", "order_id", order.ID, "err", refundErr)
 		return
 	}
 
-	if refundID != "" {
-		result, updateErr := h.db.Collection("orders").UpdateOne(ctx,
-			bson.M{"_id": order.ID, "payment_status": "refund_pending", "refund_id": bson.M{"$in": []interface{}{"", nil}}},
-			bson.M{
-				"$set": bson.M{
-					"payment_status":          "refunded",
-					"refund_id":               refundID,
-					"refund_amount":           amount,
-					"refund_requested_amount": 0,
-					"refunded_at":             now,
-					"updated_at":              now,
-				},
-				"$push": bson.M{"refunds": bson.M{"refund_id": refundID, "amount": amount, "processed_at": now}},
+	result, updateErr := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": order.ID, "payment_status": "refund_pending", "refund_processing": true, "refund_reconciliation_required": bson.M{"$ne": true}},
+		bson.M{
+			"$set": bson.M{
+				"payment_status": "refunded", "refund_id": refundID, "refund_amount": amount,
+				"refund_requested_amount": 0, "refunded_at": now, "updated_at": now,
 			},
-		)
-		if updateErr != nil || result.MatchedCount == 0 {
-			h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{"refund_reconciliation_required": true, "refund_reconciliation_id": refundID, "updated_at": time.Now()}})
-			log.Error("AUTO_REFUND", "Provider refund succeeded but order reconciliation failed", "order_id", order.ID, "refund_id", refundID, "err", updateErr)
-			return
-		}
-		log.Info("AUTO_REFUND", "Refund processed", "order_id", order.ID, "refund_id", refundID, "amount", amount)
+			"$push":  bson.M{"refunds": bson.M{"refund_id": refundID, "amount": amount, "processed_at": now}},
+			"$unset": bson.M{"refund_processing": "", "refund_processing_started_at": ""},
+		},
+	)
+	if updateErr != nil || result.MatchedCount == 0 {
+		_, _ = h.db.Collection("orders").UpdateOne(context.Background(), bson.M{"_id": order.ID}, bson.M{"$set": bson.M{
+			"refund_reconciliation_required": true, "refund_reconciliation_id": refundID, "updated_at": time.Now(),
+		}})
+		log.Error("AUTO_REFUND", "Provider refund succeeded but order reconciliation failed", "order_id", order.ID, "refund_id", refundID, "err", updateErr)
+		return
 	}
+	log.Info("AUTO_REFUND", "Refund processed", "order_id", order.ID, "refund_id", refundID, "amount", amount)
 }
 
 // processRazorpayRefund calls Razorpay's POST /v1/payments/:id/refund endpoint.

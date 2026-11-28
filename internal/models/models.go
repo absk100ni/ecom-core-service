@@ -97,48 +97,50 @@ type CartItem struct {
 
 // ==================== ORDER ====================
 type Order struct {
-	ID                    string         `json:"id" bson:"_id,omitempty"`
-	UserID                string         `json:"user_id" bson:"user_id"`
-	OrderNumber           string         `json:"order_number" bson:"order_number"`
-	IdempotencyKey        string         `json:"-" bson:"idempotency_key,omitempty"`
-	Items                 []OrderItem    `json:"items" bson:"items"`
-	Subtotal              int            `json:"subtotal" bson:"subtotal"`
-	ShippingCost          int            `json:"shipping_cost" bson:"shipping_cost"`
-	Discount              int            `json:"discount" bson:"discount"`
-	Total                 int            `json:"total" bson:"total"`                                   // in paise
-	PaymentPlan           string         `json:"payment_plan,omitempty" bson:"payment_plan,omitempty"` // "full" or "partial"
-	AdvanceAmount         int            `json:"advance_amount,omitempty" bson:"advance_amount,omitempty"`
-	CODAmount             int            `json:"cod_amount,omitempty" bson:"cod_amount,omitempty"`
-	CODCollected          bool           `json:"cod_collected" bson:"cod_collected"`
-	CouponCode            string         `json:"coupon_code,omitempty" bson:"coupon_code,omitempty"`
-	CouponUsed            bool           `json:"coupon_used" bson:"coupon_used"`         // true if coupon usage was incremented
-	CouponReleased        bool           `json:"coupon_released" bson:"coupon_released"` // true if coupon usage was decremented back
-	StockReleased         bool           `json:"stock_released" bson:"stock_released"`   // true if stock was restored on cancel/expire
-	Status                string         `json:"status" bson:"status"`
-	PaymentStatus         string         `json:"payment_status" bson:"payment_status"`
-	PaymentMethod         string         `json:"payment_method,omitempty" bson:"payment_method,omitempty"`
-	PaymentID             string         `json:"payment_id,omitempty" bson:"payment_id,omitempty"`
-	ShippingAddress       Address        `json:"shipping_address" bson:"shipping_address"`
-	BillingAddress        Address        `json:"billing_address,omitempty" bson:"billing_address,omitempty"`
-	TrackingID            string         `json:"tracking_id,omitempty" bson:"tracking_id,omitempty"`
-	TrackingURL           string         `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
-	ShipmentID            string         `json:"shipment_id,omitempty" bson:"shipment_id,omitempty"`
-	ShipmozoOrderID       string         `json:"shipmozo_order_id,omitempty" bson:"shipmozo_order_id,omitempty"`
-	ShipmozoPushStatus    string         `json:"shipmozo_push_status,omitempty" bson:"shipmozo_push_status,omitempty"`
-	IsGuest               bool           `json:"is_guest" bson:"is_guest"`
-	Notes                 string         `json:"notes,omitempty" bson:"notes,omitempty"`
-	CancelReason          string         `json:"cancel_reason,omitempty" bson:"cancel_reason,omitempty"`
-	CancelledAt           *time.Time     `json:"cancelled_at,omitempty" bson:"cancelled_at,omitempty"`
-	RefundID              string         `json:"refund_id,omitempty" bson:"refund_id,omitempty"`
-	RefundAmount          int            `json:"refund_amount,omitempty" bson:"refund_amount,omitempty"`
-	RefundRequestedAmount int            `json:"refund_requested_amount,omitempty" bson:"refund_requested_amount,omitempty"`
-	Refunds               []RefundRecord `json:"refunds,omitempty" bson:"refunds,omitempty"`
-	RefundedAt            *time.Time     `json:"refunded_at,omitempty" bson:"refunded_at,omitempty"`
-	DeliveredAt           *time.Time     `json:"delivered_at,omitempty" bson:"delivered_at,omitempty"`
-	InvoiceNumber         string         `json:"invoice_number,omitempty" bson:"invoice_number,omitempty"`
-	InvoiceDate           *time.Time     `json:"invoice_date,omitempty" bson:"invoice_date,omitempty"`
-	CreatedAt             time.Time      `json:"created_at" bson:"created_at"`
-	UpdatedAt             time.Time      `json:"updated_at" bson:"updated_at"`
+	ID                        string         `json:"id" bson:"_id,omitempty"`
+	UserID                    string         `json:"user_id" bson:"user_id"`
+	OrderNumber               string         `json:"order_number" bson:"order_number"`
+	IdempotencyKey            string         `json:"-" bson:"idempotency_key,omitempty"`
+	Items                     []OrderItem    `json:"items" bson:"items"`
+	Subtotal                  int            `json:"subtotal" bson:"subtotal"`
+	ShippingCost              int            `json:"shipping_cost" bson:"shipping_cost"`
+	Discount                  int            `json:"discount" bson:"discount"`
+	Total                     int            `json:"total" bson:"total"`                                   // in paise
+	PaymentPlan               string         `json:"payment_plan,omitempty" bson:"payment_plan,omitempty"` // "full" or "partial"
+	AdvanceAmount             int            `json:"advance_amount,omitempty" bson:"advance_amount,omitempty"`
+	CODAmount                 int            `json:"cod_amount,omitempty" bson:"cod_amount,omitempty"`
+	CODCollected              bool           `json:"cod_collected" bson:"cod_collected"`
+	CouponCode                string         `json:"coupon_code,omitempty" bson:"coupon_code,omitempty"`
+	CouponUsed                bool           `json:"coupon_used" bson:"coupon_used"`         // true if coupon usage was incremented
+	CouponReleased            bool           `json:"coupon_released" bson:"coupon_released"` // true if coupon usage was decremented back
+	StockReleased             bool           `json:"stock_released" bson:"stock_released"`   // true if stock was restored on cancel/expire
+	Status                    string         `json:"status" bson:"status"`
+	PaymentStatus             string         `json:"payment_status" bson:"payment_status"`
+	PaymentMethod             string         `json:"payment_method,omitempty" bson:"payment_method,omitempty"`
+	PaymentID                 string         `json:"payment_id,omitempty" bson:"payment_id,omitempty"`
+	PaymentValidationMismatch bool           `json:"payment_validation_mismatch,omitempty" bson:"payment_validation_mismatch,omitempty"`
+	ShippingAddress           Address        `json:"shipping_address" bson:"shipping_address"`
+	BillingAddress            Address        `json:"billing_address,omitempty" bson:"billing_address,omitempty"`
+	TrackingID                string         `json:"tracking_id,omitempty" bson:"tracking_id,omitempty"`
+	TrackingURL               string         `json:"tracking_url,omitempty" bson:"tracking_url,omitempty"`
+	ShipmentID                string         `json:"shipment_id,omitempty" bson:"shipment_id,omitempty"`
+	ShipmozoOrderID           string         `json:"shipmozo_order_id,omitempty" bson:"shipmozo_order_id,omitempty"`
+	ShipmozoPushStatus        string         `json:"shipmozo_push_status,omitempty" bson:"shipmozo_push_status,omitempty"`
+	IsGuest                   bool           `json:"is_guest" bson:"is_guest"`
+	Notes                     string         `json:"notes,omitempty" bson:"notes,omitempty"`
+	CancelReason              string         `json:"cancel_reason,omitempty" bson:"cancel_reason,omitempty"`
+	CancelledAt               *time.Time     `json:"cancelled_at,omitempty" bson:"cancelled_at,omitempty"`
+	RefundID                  string         `json:"refund_id,omitempty" bson:"refund_id,omitempty"`
+	RefundAmount              int            `json:"refund_amount,omitempty" bson:"refund_amount,omitempty"`
+	RefundRequestedAmount     int            `json:"refund_requested_amount,omitempty" bson:"refund_requested_amount,omitempty"`
+	Refunds                   []RefundRecord `json:"refunds,omitempty" bson:"refunds,omitempty"`
+	RefundedAt                *time.Time     `json:"refunded_at,omitempty" bson:"refunded_at,omitempty"`
+	DeliveredAt               *time.Time     `json:"delivered_at,omitempty" bson:"delivered_at,omitempty"`
+	InvoiceNumber             string         `json:"invoice_number,omitempty" bson:"invoice_number,omitempty"`
+	InvoiceDate               *time.Time     `json:"invoice_date,omitempty" bson:"invoice_date,omitempty"`
+	ArchivedAt                *time.Time     `json:"archived_at,omitempty" bson:"archived_at,omitempty"`
+	CreatedAt                 time.Time      `json:"created_at" bson:"created_at"`
+	UpdatedAt                 time.Time      `json:"updated_at" bson:"updated_at"`
 }
 
 type RefundRecord struct {

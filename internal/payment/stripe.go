@@ -228,12 +228,15 @@ func VerifyStripeWebhookSignature(payload []byte, sigHeader, secret string) (int
 
 // VerifyStripePaymentIntent validates a PaymentIntent meets our requirements for marking paid.
 // Returns nil if valid, error describing the mismatch otherwise.
-func VerifyStripePaymentIntent(pi *StripePaymentIntent, expectedAmount int, expectedOrderID string) error {
+func VerifyStripePaymentIntent(pi *StripePaymentIntent, expectedAmount int, expectedCurrency, expectedOrderID string) error {
 	if pi.Status != "succeeded" {
 		return fmt.Errorf("payment_intent status is %q, expected \"succeeded\"", pi.Status)
 	}
 	if pi.Amount != expectedAmount {
 		return fmt.Errorf("amount mismatch: stripe=%d, expected=%d", pi.Amount, expectedAmount)
+	}
+	if !strings.EqualFold(pi.Currency, expectedCurrency) {
+		return fmt.Errorf("currency mismatch: stripe=%q, expected=%q", pi.Currency, expectedCurrency)
 	}
 	if pi.Metadata["order_id"] != expectedOrderID {
 		return fmt.Errorf("metadata.order_id mismatch: stripe=%q, expected=%q", pi.Metadata["order_id"], expectedOrderID)
