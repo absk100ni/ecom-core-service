@@ -12,7 +12,11 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const WebsiteMaintenance = "website_maintenance"
+const (
+	WebsiteMaintenance   = "website_maintenance"
+	PhoneLoginEnabled    = "phone_login_enabled"
+	GuestCheckoutEnabled = "guest_checkout_enabled"
+)
 
 var keyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{2,63}$`)
 
@@ -24,8 +28,12 @@ type Service struct{ db *mongo.Database }
 
 func New(db *mongo.Database) *Service { return &Service{db: db} }
 func (s *Service) Seed(ctx context.Context) error {
-	_, err := s.db.Collection("feature_flags").UpdateOne(ctx, bson.M{"_id": WebsiteMaintenance}, bson.M{"$setOnInsert": bson.M{"enabled": false}}, options.Update().SetUpsert(true))
-	return err
+	for _, key := range []string{WebsiteMaintenance, PhoneLoginEnabled, GuestCheckoutEnabled} {
+		if _, err := s.db.Collection("feature_flags").UpdateOne(ctx, bson.M{"_id": key}, bson.M{"$setOnInsert": bson.M{"enabled": false}}, options.Update().SetUpsert(true)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Service) Enabled(ctx context.Context, key string) bool {
 	var f Flag

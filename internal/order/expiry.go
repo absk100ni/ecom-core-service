@@ -44,10 +44,14 @@ func sweep(db *mongo.Database, ttl time.Duration) {
 	cutoff := time.Now().Add(-ttl)
 
 	// Find orders that are placed+pending and older than the TTL
+	guestCutoff := time.Now().Add(-10 * time.Minute)
 	filter := bson.M{
 		"payment_status": "pending",
 		"status":         bson.M{"$in": []string{"placed"}},
-		"created_at":     bson.M{"$lt": cutoff},
+		"$or": []bson.M{
+			{"is_guest": true, "created_at": bson.M{"$lt": guestCutoff}},
+			{"is_guest": bson.M{"$ne": true}, "created_at": bson.M{"$lt": cutoff}},
+		},
 	}
 
 	cursor, err := db.Collection("orders").Find(ctx, filter, options.Find().SetLimit(100))

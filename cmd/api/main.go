@@ -240,11 +240,11 @@ func main() {
 		guestGroup := api.Group("/guest")
 		guestGroup.Use(middleware.RateLimitMiddleware(appCache, 20, time.Minute))
 		{
-			guestGroup.POST("/orders", featureFlagService.BlockDuringMaintenance, checkoutGuard, guestH.CreateOrder)
-			guestGroup.POST("/payment/create", featureFlagService.BlockDuringMaintenance, checkoutGuard, guestH.CreatePayment)
+			guestGroup.POST("/orders", middleware.RateLimitMiddleware(appCache, 3, 10*time.Minute), featureFlagService.RequireEnabled(featureflags.GuestCheckoutEnabled), featureFlagService.BlockDuringMaintenance, checkoutGuard, guestH.CreateOrder)
+			guestGroup.POST("/payment/create", middleware.RateLimitMiddleware(appCache, 5, 10*time.Minute), featureFlagService.RequireEnabled(featureflags.GuestCheckoutEnabled), featureFlagService.BlockDuringMaintenance, checkoutGuard, guestH.CreatePayment)
 			guestGroup.POST("/payment/verify", guestH.VerifyPayment)
 			guestGroup.POST("/orders/:id/abandon", guestH.Abandon)
-			guestGroup.GET("/orders/track", guestH.Track)
+			guestGroup.GET("/orders/track", middleware.RateLimitMiddleware(appCache, 5, 15*time.Minute), guestH.Track)
 		}
 	}
 

@@ -101,6 +101,7 @@ type guestOrderRequest struct {
 	ShippingAddress models.Address `json:"shipping_address" binding:"required"`
 	PaymentPlan     string         `json:"payment_plan,omitempty"`
 	CouponCode      string         `json:"coupon_code,omitempty"`
+	TurnstileToken  string         `json:"turnstile_token"`
 }
 
 type guestItem struct {
@@ -118,7 +119,10 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 	}
 
 	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
-	if idempotencyKey == "" { c.JSON(http.StatusBadRequest, gin.H{"error":"Idempotency-Key header is required"}); return }
+	if idempotencyKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header is required"})
+		return
+	}
 
 	// Validate item count
 	if len(req.Items) == 0 || len(req.Items) > 20 {
@@ -154,6 +158,21 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 	// Resolve product details to build CartItem slice (guests don't have a server cart)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+
+	if !verifyTurnstile(ctx, h.cfg.TurnstileSecretKey, req.TurnstileToken, c.ClientIP(), h.cfg.TurnstileBypass) {
+		log.Warn("TURNSTILE", "Guest checkout challenge rejected", "ip", c.ClientIP())
+		c.JSON(http.StatusForbidden, gin.H{"error": "Guest checkout verification failed", "code": "EGST005"})
+		return
+	}
+	pendingCount, countErr := h.db.Collection("orders").CountDocuments(ctx, bson.M{"is_guest": true, "shipping_address.phone": addr.Phone, "status": "placed", "payment_status": "pending"})
+	if countErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not verify pending orders"})
+		return
+	}
+	if pendingCount >= 2 {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many pending guest orders for this phone", "code": "EGST006"})
+		return
+	}
 
 	cartItems := make([]models.CartItem, 0, len(req.Items))
 	for _, gi := range req.Items {
