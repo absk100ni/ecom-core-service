@@ -20,6 +20,9 @@ type Config struct {
 	MSG91TemplateID string
 	// Google Auth
 	GoogleClientID string
+	// Guest bot protection
+	TurnstileSecretKey string
+	TurnstileBypass    bool
 	// Payment
 	PaymentGateway        string // "stripe", "razorpay", or "cashfree"
 	StripeSecretKey       string // sk_test_... or sk_live_...
@@ -123,6 +126,8 @@ func Load() *Config {
 		MSG91AuthKey:                 getEnv("MSG91_AUTH_KEY", ""),
 		MSG91TemplateID:              getEnv("MSG91_TEMPLATE_ID", ""),
 		GoogleClientID:               getEnv("GOOGLE_CLIENT_ID", ""),
+		TurnstileSecretKey:          getEnv("TURNSTILE_SECRET_KEY", ""),
+		TurnstileBypass:             getEnv("TURNSTILE_TEST_BYPASS", "false") == "true",
 		PaymentGateway:               getEnv("PAYMENT_GATEWAY", "razorpay"),
 		StripeSecretKey:              getEnv("STRIPE_SECRET_KEY", ""),
 		StripePublishableKey:         getEnv("STRIPE_PUBLISHABLE_KEY", ""),
