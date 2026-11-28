@@ -21,12 +21,14 @@ import (
 var log = logger.New("OPS", "MONITOR")
 
 const (
-	EventPendingPaymentStale = "OPS_PAYMENT_PENDING_STALE"
-	EventPaidStateMismatch   = "OPS_PAYMENT_ORDER_MISMATCH"
-	EventShipmentMissing     = "OPS_SHIPMENT_MISSING"
-	EventAWBMissing          = "OPS_SHIPMENT_AWB_MISSING"
-	EventRefundPending       = "OPS_REFUND_PENDING_STALE"
-	EventStockRollback       = "OPS_STOCK_ROLLBACK_INCOMPLETE"
+	EventPendingPaymentStale    = "OPS_PAYMENT_PENDING_STALE"
+	EventPaidStateMismatch      = "OPS_PAYMENT_ORDER_MISMATCH"
+	EventShipmentMissing        = "OPS_SHIPMENT_MISSING"
+	EventAWBMissing             = "OPS_SHIPMENT_AWB_MISSING"
+	EventRefundPending          = "OPS_REFUND_PENDING_STALE"
+	EventStockRollback          = "OPS_STOCK_ROLLBACK_INCOMPLETE"
+	EventPaymentAmountMismatch  = "OPS_PAYMENT_AMOUNT_MISMATCH"
+	EventShipmentCancelMismatch = "OPS_SHIPMENT_CANCELLATION_MISMATCH"
 )
 
 type Anomaly struct {
@@ -212,6 +214,8 @@ func (s *Service) Scan(ctx context.Context) error {
 		{EventShipmentMissing, "high", "Confirmed order has no recorded shipment", "Check fulfillment readiness and Shipmozo before creating a shipment", bson.M{"status": bson.M{"$in": []string{"confirmed", "processing"}}, "created_at": bson.M{"$lt": now.Add(-time.Duration(s.cfg.OpsShipmentStaleMinutes) * time.Minute)}, "$or": []bson.M{{"shipment_id": ""}, {"shipment_id": bson.M{"$exists": false}}}}, now},
 		{EventRefundPending, "critical", "Refund remains pending beyond the reconciliation window", "Compare the refund with the payment provider before retrying", bson.M{"payment_status": "refund_pending", "updated_at": bson.M{"$lt": now.Add(-time.Duration(s.cfg.OpsRefundStaleMinutes) * time.Minute)}}, now},
 		{EventStockRollback, "high", "Cancelled or expired order has no completed stock release", "Inspect stock movement before manually correcting inventory", bson.M{"status": bson.M{"$in": []string{"cancelled", "expired"}}, "stock_released": bson.M{"$ne": true}}, now},
+		{EventPaymentAmountMismatch, "critical", "Provider payment amount or currency disagrees with the order payment", "Do not fulfill or refund until the provider payment is reconciled", bson.M{"payment_validation_mismatch": true}, now},
+		{EventShipmentCancelMismatch, "critical", "Local cancellation was blocked because the order still exists in Shipmozo", "Cancel the order in Shipmozo and wait for provider confirmation before retrying locally", bson.M{"shipment_cancellation_blocked": true}, now},
 	}
 	for _, check := range orderChecks {
 		cursor, err := s.db.Collection("orders").Find(ctx, check.filter, options.Find().SetProjection(bson.M{"_id": 1, "created_at": 1, "updated_at": 1}))

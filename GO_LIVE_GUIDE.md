@@ -225,20 +225,13 @@ small bandwidth costs).
 **Steps:**
 1. Sign up at aws.amazon.com (needs card; there's a generous free tier for year 1).
 2. **Create the bucket:** search "S3" in the console → Create bucket →
-   name like `electromart-images`, region **ap-south-1 (Mumbai)** →
-   under "Block Public Access" **uncheck blocking** (images must be publicly viewable)
-   → create.
-3. **Bucket → Permissions → Bucket policy** — paste (replace the bucket name):
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow", "Principal": "*",
-    "Action": "s3:GetObject",
-    "Resource": "arn:aws:s3:::electromart-images/*"
-  }]
-}
-```
+   name like `electromart-images`, region **ap-south-1 (Mumbai)** → keep all
+   **Block Public Access** settings enabled → create.
+3. **Create a CloudFront distribution** with the S3 bucket as its origin. Enable
+   Origin Access Control (OAC), use "Sign requests", and let CloudFront add the
+   bucket policy that grants `s3:GetObject` only to that distribution. Do not add
+   `Principal: "*"`, public ACLs, or disable S3 Block Public Access. Set the
+   distribution domain (or your CDN custom domain) as `S3_PUBLIC_BASE_URL`.
 4. **Bucket → Permissions → CORS** — paste (replace admin domain). Without this,
    browser uploads from the admin panel will fail:
 ```json
@@ -260,6 +253,7 @@ small bandwidth costs).
 ```
 S3_BUCKET=electromart-images
 S3_REGION=ap-south-1
+S3_PUBLIC_BASE_URL=https://your-cloudfront-domain.example
 AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
 ```
@@ -281,8 +275,9 @@ the collected amount. Rates depend on your volume — check your dashboard's rat
 1. Register as a seller at shipmozo.com → complete KYC (GSTIN, bank, pickup address).
 2. Find **API keys** in the dashboard (Settings/Developers section) — copy the
    public and private key.
-3. Set up their webhook (delivery status updates) pointing to
-   `https://api.yourstore.com/api/v1/shipping/webhook` with a secret token you invent.
+3. Do not configure a Shipmozo webhook unless Shipmozo provides a documented,
+   signed webhook contract for this account. LucubraElec uses authenticated
+   `/track-order` polling for shipment status.
 
 **What goes in backend `.env`:**
 ```

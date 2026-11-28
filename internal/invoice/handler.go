@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"time"
 
 	"ecom-core-service/internal/config"
@@ -29,6 +30,16 @@ func NewHandler(db *mongo.Database, cfg *config.Config) *Handler {
 	return &Handler{db: db, cfg: cfg}
 }
 
+func invoiceEligible(order *models.Order) error {
+	if order.PaymentStatus != "paid" {
+		return fmt.Errorf("invoice available only after payment is confirmed")
+	}
+	if order.PaymentPlan == "partial" && order.CODAmount > 0 && !order.CODCollected {
+		return fmt.Errorf("final invoice is available only after the COD balance is collected")
+	}
+	return nil
+}
+
 // GetInvoice serves the GST invoice HTML for a customer's own order
 func (h *Handler) GetInvoice(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -48,8 +59,8 @@ func (h *Handler) GetInvoice(c *gin.Context) {
 		return
 	}
 
-	if order.PaymentStatus != "paid" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invoice available only after payment is confirmed", "code": errcodes.EInvNotReady.Code})
+	if eligibilityErr := invoiceEligible(&order); eligibilityErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": eligibilityErr.Error(), "code": errcodes.EInvNotReady.Code})
 		return
 	}
 
@@ -70,8 +81,8 @@ func (h *Handler) AdminGetInvoice(c *gin.Context) {
 		return
 	}
 
-	if order.PaymentStatus != "paid" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invoice available only after payment is confirmed", "code": errcodes.EInvNotReady.Code})
+	if eligibilityErr := invoiceEligible(&order); eligibilityErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": eligibilityErr.Error(), "code": errcodes.EInvNotReady.Code})
 		return
 	}
 
@@ -141,13 +152,27 @@ func (h *Handler) assignInvoiceNumber(ctx context.Context, order *models.Order) 
 	invNum := fmt.Sprintf("INV-%s-%06d", fy, result.Seq)
 	invDate := now
 
-	// Store on order
-	_, err = h.db.Collection("orders").UpdateOne(ctx,
-		bson.M{"_id": order.ID},
+	// Store only if no invoice has been assigned. Concurrent callers may consume
+	// extra counter values, but exactly one number can win for an order.
+	updateResult, err := h.db.Collection("orders").UpdateOne(ctx,
+		bson.M{"_id": order.ID, "$or": []bson.M{{"invoice_number": ""}, {"invoice_number": bson.M{"$exists": false}}}},
 		bson.M{"$set": bson.M{"invoice_number": invNum, "invoice_date": invDate, "updated_at": now}},
 	)
 	if err != nil {
 		return "", nil, fmt.Errorf("order update failed: %w", err)
+	}
+	if updateResult.MatchedCount == 0 {
+		var winner struct {
+			InvoiceNumber string     `bson:"invoice_number"`
+			InvoiceDate   *time.Time `bson:"invoice_date"`
+		}
+		if readErr := h.db.Collection("orders").FindOne(ctx, bson.M{"_id": order.ID}).Decode(&winner); readErr != nil {
+			return "", nil, fmt.Errorf("invoice assignment lost race and winner could not be read: %w", readErr)
+		}
+		if winner.InvoiceNumber == "" || winner.InvoiceDate == nil {
+			return "", nil, fmt.Errorf("invoice assignment lost race without a completed winner")
+		}
+		return winner.InvoiceNumber, winner.InvoiceDate, nil
 	}
 
 	return invNum, &invDate, nil
@@ -185,39 +210,92 @@ type InvoiceLine struct {
 	Description  string
 	HSN          string
 	Qty          int
-	UnitPrice    int // paise
+	UnitPrice    int // paise before line discount
+	Discount     int // paise allocated proportionally from order discount
 	TaxableValue int // paise
 	GSTRate      int // percent
 	GSTAmount    int // paise
-	LineTotal    int // paise (inclusive)
+	LineTotal    int // paise (inclusive, after discount)
 }
 
 func (h *Handler) computeInvoiceLines(order *models.Order, prodMap map[string]*models.Product) ([]InvoiceLine, error) {
-	lines := make([]InvoiceLine, 0, len(order.Items))
-	for _, item := range order.Items {
+	if len(order.Items) == 0 {
+		return nil, fmt.Errorf("invoice requires at least one order item")
+	}
+
+	grossTotals := make([]int, len(order.Items))
+	grossSubtotal := 0
+	for i, item := range order.Items {
+		if item.Quantity <= 0 || item.Price <= 0 {
+			return nil, fmt.Errorf("invalid quantity or price for %s", item.Name)
+		}
+		grossTotals[i] = item.Price * item.Quantity
+		grossSubtotal += grossTotals[i]
+	}
+	if grossSubtotal != order.Subtotal {
+		return nil, fmt.Errorf("invoice subtotal mismatch: items total %d, order subtotal %d", grossSubtotal, order.Subtotal)
+	}
+	if order.Discount < 0 || order.Discount > grossSubtotal {
+		return nil, fmt.Errorf("invoice discount is outside the merchandise subtotal")
+	}
+
+	// Allocate the order discount proportionally using the largest-remainder
+	// method. This keeps every paise accounted for while avoiding tax on the
+	// pre-discount merchandise value.
+	discounts := make([]int, len(order.Items))
+	type remainder struct {
+		index int
+		value int64
+	}
+	remainders := make([]remainder, len(order.Items))
+	allocated := 0
+	for i, gross := range grossTotals {
+		product := int64(order.Discount) * int64(gross)
+		discounts[i] = int(product / int64(grossSubtotal))
+		allocated += discounts[i]
+		remainders[i] = remainder{index: i, value: product % int64(grossSubtotal)}
+	}
+	sort.SliceStable(remainders, func(i, j int) bool { return remainders[i].value > remainders[j].value })
+	for i := 0; i < order.Discount-allocated; i++ {
+		discounts[remainders[i].index]++
+	}
+
+	lines := make([]InvoiceLine, 0, len(order.Items)+1)
+	invoiceTotal := 0
+	for i, item := range order.Items {
 		product, ok := prodMap[item.ProductID]
 		if !ok {
-			return nil, fmt.Errorf("Tax data is unavailable for product %s", item.ProductID)
+			return nil, fmt.Errorf("tax data is unavailable for product %s", item.ProductID)
 		}
 		if product.GSTPercent <= 0 || product.GSTPercent > 100 || product.HSNCode == "" {
 			return nil, fmt.Errorf("GST rate and HSN code are required for %s", item.Name)
 		}
-		rate := product.GSTPercent
-		hsn := product.HSNCode
-		lineTotal := item.Price * item.Quantity // GST-inclusive paise
-		taxable := GSTInclusiveTaxable(lineTotal, rate)
+		lineTotal := grossTotals[i] - discounts[i]
+		taxable := GSTInclusiveTaxable(lineTotal, product.GSTPercent)
 		gst := lineTotal - taxable
-
 		lines = append(lines, InvoiceLine{
-			Description:  item.Name,
-			HSN:          hsn,
-			Qty:          item.Quantity,
-			UnitPrice:    item.Price,
-			TaxableValue: taxable,
-			GSTRate:      rate,
-			GSTAmount:    gst,
-			LineTotal:    lineTotal,
+			Description: item.Name, HSN: product.HSNCode, Qty: item.Quantity,
+			UnitPrice: item.Price, Discount: discounts[i], TaxableValue: taxable,
+			GSTRate: product.GSTPercent, GSTAmount: gst, LineTotal: lineTotal,
 		})
+		invoiceTotal += lineTotal
+	}
+
+	if order.ShippingCost > 0 {
+		if h.cfg == nil || h.cfg.ShippingGSTPercent <= 0 || h.cfg.ShippingGSTPercent > 100 || h.cfg.ShippingHSNCode == "" {
+			return nil, fmt.Errorf("shipping GST percentage and HSN/SAC code are required when shipping is charged")
+		}
+		taxable := GSTInclusiveTaxable(order.ShippingCost, h.cfg.ShippingGSTPercent)
+		lines = append(lines, InvoiceLine{
+			Description: "Shipping", HSN: h.cfg.ShippingHSNCode, Qty: 1,
+			UnitPrice: order.ShippingCost, TaxableValue: taxable,
+			GSTRate: h.cfg.ShippingGSTPercent, GSTAmount: order.ShippingCost - taxable,
+			LineTotal: order.ShippingCost,
+		})
+		invoiceTotal += order.ShippingCost
+	}
+	if invoiceTotal != order.Total {
+		return nil, fmt.Errorf("invoice total mismatch: computed %d, order total %d", invoiceTotal, order.Total)
 	}
 	return lines, nil
 }

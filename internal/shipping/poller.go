@@ -134,6 +134,11 @@ func (h *Handler) updateOrderFromTracking(ctx context.Context, orderID, status s
 		if h.db.Collection("orders").FindOne(ctx, bson.M{"_id": orderID}).Decode(&order) == nil && order.CODAmount > 0 {
 			set["cod_collected"] = true
 		}
+	case "cancelled":
+		// Provider cancellation is a prerequisite for changing the local order to
+		// cancelled. Record the confirmation, then let the normal cancellation
+		// path release stock/coupons and initiate any refund.
+		set["shipmozo_push_status"] = "cancelled"
 	default:
 		return
 	}

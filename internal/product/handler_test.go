@@ -221,3 +221,40 @@ func TestCollectDescendantSlugsPathPrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRequiredNonNegativeInt(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    int
+		wantErr bool
+	}{
+		{name: "zero inventory is valid", value: "0", want: 0},
+		{name: "positive inventory", value: "27", want: 27},
+		{name: "trim whitespace", value: " 4 ", want: 4},
+		{name: "missing inventory", value: "", wantErr: true},
+		{name: "negative inventory", value: "-1", wantErr: true},
+		{name: "invalid inventory", value: "many", wantErr: true},
+		{name: "decimal inventory", value: "1.5", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseRequiredNonNegativeInt(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Fatalf("value = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCSVRequiresStockColumn(t *testing.T) {
+	for _, column := range requiredCSVColumns {
+		if column == "stock" {
+			return
+		}
+	}
+	t.Fatal("stock must be a required CSV column")
+}

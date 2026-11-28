@@ -80,13 +80,15 @@ type Config struct {
 	// Contact
 	ContactNotifyEmail string
 	// GST / Invoice
-	BusinessLegalName string
-	BusinessAddress   string
-	BusinessGSTIN     string
-	BusinessState     string
-	BusinessStateCode string
-	DefaultGSTPercent int
-	DefaultHSNCode    string
+	BusinessLegalName  string
+	BusinessAddress    string
+	BusinessGSTIN      string
+	BusinessState      string
+	BusinessStateCode  string
+	DefaultGSTPercent  int
+	DefaultHSNCode     string
+	ShippingGSTPercent int
+	ShippingHSNCode    string
 	// Returns
 	ReturnWindowDays int
 	// Order Expiry
@@ -126,8 +128,8 @@ func Load() *Config {
 		MSG91AuthKey:                 getEnv("MSG91_AUTH_KEY", ""),
 		MSG91TemplateID:              getEnv("MSG91_TEMPLATE_ID", ""),
 		GoogleClientID:               getEnv("GOOGLE_CLIENT_ID", ""),
-		TurnstileSecretKey:          getEnv("TURNSTILE_SECRET_KEY", ""),
-		TurnstileBypass:             getEnv("TURNSTILE_TEST_BYPASS", "false") == "true",
+		TurnstileSecretKey:           getEnv("TURNSTILE_SECRET_KEY", ""),
+		TurnstileBypass:              getEnv("TURNSTILE_TEST_BYPASS", "false") == "true",
 		PaymentGateway:               getEnv("PAYMENT_GATEWAY", "razorpay"),
 		StripeSecretKey:              getEnv("STRIPE_SECRET_KEY", ""),
 		StripePublishableKey:         getEnv("STRIPE_PUBLISHABLE_KEY", ""),
@@ -179,6 +181,8 @@ func Load() *Config {
 		BusinessStateCode:            getEnv("BUSINESS_STATE_CODE", ""),
 		DefaultGSTPercent:            atoiDefault(getEnv("DEFAULT_GST_PERCENT", "0"), 0),
 		DefaultHSNCode:               getEnv("DEFAULT_HSN_CODE", ""),
+		ShippingGSTPercent:           atoiDefault(getEnv("SHIPPING_GST_PERCENT", "0"), 0),
+		ShippingHSNCode:              getEnv("SHIPPING_HSN_CODE", ""),
 		ReturnWindowDays:             atoiDefault(getEnv("RETURN_WINDOW_DAYS", "7"), 7),
 		PendingOrderTTLMinutes:       atoiDefault(getEnv("PENDING_ORDER_TTL_MINUTES", "30"), 30),
 		GuestTokenSecret:             getEnvWithFallback("GUEST_TOKEN_SECRET", "JWT_SECRET", "dev-guest-secret"),

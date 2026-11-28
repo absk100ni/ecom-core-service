@@ -63,3 +63,60 @@ func TestOneStockAllowsExactlyOneConcurrentReservation(t *testing.T) {
 		t.Fatalf("remaining stock = %d, want 0", stored.Stock)
 	}
 }
+
+func TestArchiveDeadOrdersRetainsReconciliationEvidence(t *testing.T) {
+	db := concurrencyDB(t)
+	ctx := context.Background()
+	old := time.Now().Add(-48 * time.Hour)
+	_, err := db.Collection("orders").InsertMany(ctx, []interface{}{
+		bson.M{"_id": "expired-old", "status": "expired", "updated_at": old, "payment_id": "pay_late", "stock_released": true},
+		bson.M{"_id": "abandoned-old", "status": "abandoned", "updated_at": old, "coupon_released": true},
+		bson.M{"_id": "expired-new", "status": "expired", "updated_at": time.Now()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := archiveDeadOrders(ctx, db, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("archived count = %d, want 2", count)
+	}
+	var retained bson.M
+	if err := db.Collection("orders").FindOne(ctx, bson.M{"_id": "expired-old"}).Decode(&retained); err != nil {
+		t.Fatalf("archived order was deleted: %v", err)
+	}
+	if retained["payment_id"] != "pay_late" || retained["archived_at"] == nil {
+		t.Fatalf("reconciliation evidence not retained: %#v", retained)
+	}
+	if again, err := archiveDeadOrders(ctx, db, time.Now().Add(-24*time.Hour)); err != nil || again != 0 {
+		t.Fatalf("archive must be idempotent, count=%d err=%v", again, err)
+	}
+}
+
+func TestAutoRefundTimeoutKeepsClaimLocked(t *testing.T) {
+	db := concurrencyDB(t)
+	ctx := context.Background()
+	order := models.Order{ID: "refund-order", PaymentStatus: "refund_pending", PaymentID: "pay_123", Total: 5000, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if _, err := db.Collection("orders").InsertOne(ctx, order); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	handler := &Handler{db: db, cfg: &config.Config{}, refundPayment: func(string, int) (string, error) {
+		calls.Add(1)
+		return "", context.DeadlineExceeded
+	}}
+	handler.attemptAutoRefund(ctx, &order, order.Total)
+	handler.attemptAutoRefund(ctx, &order, order.Total)
+	if calls.Load() != 1 {
+		t.Fatalf("provider calls = %d, want 1", calls.Load())
+	}
+	var stored bson.M
+	if err := db.Collection("orders").FindOne(ctx, bson.M{"_id": order.ID}).Decode(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored["refund_processing"] != true || stored["refund_reconciliation_required"] != true {
+		t.Fatalf("ambiguous refund claim was not locked: %#v", stored)
+	}
+}
